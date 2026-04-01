@@ -1,0 +1,61 @@
+# send two wps
+ros2 service call /mauv_1/simple_controller_node/set_waypoint mvp_msgs/srv/SendWaypoints "{
+  type: 'example_type',
+  wpt: [
+    {
+      header: {
+        stamp: {sec: 0, nanosec: 0},
+        frame_id: 'map'
+      },
+      wpt: {
+        x: 1.0,
+        y: 2.0,
+        z: 0.0
+      },
+      ll_wpt: {
+        latitude: 40.0,
+        longitude: -70.0,
+        altitude: 10.0
+      }
+    },
+    {
+      header: {
+        stamp: {sec: 0, nanosec: 0},
+        frame_id: 'map'
+      },
+      wpt: {
+        x: 3.0,
+        y: 4.0,
+        z: 0.0
+      },
+      ll_wpt: {
+        latitude: 42.0,
+        longitude: -72.0,
+        altitude: 12.0
+      }
+    }
+  ]
+}"
+
+# send onw wps
+ros2 service call /mauv_1/simple_controller_node/set_waypoint mvp_msgs/srv/SendWaypoints "{
+  type: 'example_type',
+  wpt: [
+    {
+      header: {
+        stamp: {sec: 0, nanosec: 0},
+        frame_id: 'map'
+      },
+      wpt: {
+        x: -1.0,
+        y: 20.0,
+        z: 1.0
+      },
+      ll_wpt: {
+        latitude: 40.0,
+        longitude: -70.0,
+        altitude: 10.0
+      }
+    }
+  ]
+}"

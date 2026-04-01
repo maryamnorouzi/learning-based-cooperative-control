@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>simple_controller_pkg</name>
+  <version>0.0.0</version>
+  <description>Simple controller node with CUDA RBF helper.</description>
+  <maintainer email="m.noroozi20@gmail.com">soslab-p330</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Core deps (ok to keep as <depend/>) -->
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geographic_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>mvp_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <!-- Launch-time deps (for your .launch.py) -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- Optional: let rosdep install CUDA toolkit on Ubuntu/Debian -->
+  <!-- Remove if you prefer managing CUDA yourself -->
+  <!-- <build_depend>nvidia-cuda-toolkit</build_depend> -->
+
+  <!-- <test_depend>ament_lint_auto</test_depend> -->
+  <!-- <test_depend>ament_lint_common</test_depend> -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

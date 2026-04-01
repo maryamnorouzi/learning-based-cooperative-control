@@ -1,0 +1,20 @@
+# /mauv_1/simple_controller_node:
+# /**:
+#   ros__parameters:
+#     param_int: 12
+#     global_frame: mauv_1/world
+#     odom_is_enu: true
+#     offset_x: 0.0
+#     offset_y: 0.0
+#     offset_z: 0.0
+#     offset_pitch: 0.0
+
+/**:
+  ros__parameters:
+    param_int: 12
+    global_frame: ""
+    odom_is_enu: true
+    offset_x: 0.0
+    offset_y: 0.0
+    offset_z: 0.0
+    offset_pitch: 0.0
