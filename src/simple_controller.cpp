@@ -1,4 +1,5 @@
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <deque>
 #include <mutex>
@@ -14,9 +15,11 @@
 #include <cstdint> 
 #include <cstdio>
 #include <algorithm>
+#include <unordered_map>
 #include <Eigen/Dense>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -39,14 +42,14 @@
 using std::placeholders::_1;
 
 // ============================================================================
-// World and state definitions
+// State Types And Control Indices
 // ============================================================================
 // World frame: mauv_1/world = ENU (East, North, Up)
 // X: +X = East, −X = West  (Surge) --> Roll
 // Y: +Y = North, −Y = South (Sway) --> Yaw
 // Z: +Z = Up, −Z = Down    (Heave) --> Pitch
 
-struct FullState   //  A struct is a data bundle.
+struct FullState
 { 
   rclcpp::Time stamp;
   std::string frame_id;
@@ -72,11 +75,11 @@ enum {
   WPITCH = 3    // Pitch angle
 };
 
-// Controller 4-D vectors:
-// index 0 -> X : controlled by SURGE_T
-// index 1 -> Y,  equivalent to YAW : controlled by SWAY_BOW_T
-// index 2 -> Z : controlled by HEAVE_BOW_T
-// index 3 -> PITCH : controlled by HEAVE_STERN_T
+// Controller 4-D channels:
+// index 0 -> surge-axis force Fx (mapped mainly to SURGE_T)
+// index 1 -> yaw/sway control channel (stored in the Y slot, mapped mainly to SWAY_BOW_T)
+// index 2 -> heave-axis force Fz (allocated across the heave thrusters)
+// index 3 -> pitch moment My (realized by differential heave thruster action)
 
 // Thrusters
 enum { SURGE_T = 0, HEAVE_BOW_T = 1, HEAVE_STERN_T = 2, SWAY_BOW_T = 3 };
@@ -84,8 +87,10 @@ enum { SURGE_T = 0, HEAVE_BOW_T = 1, HEAVE_STERN_T = 2, SWAY_BOW_T = 3 };
 constexpr double PI = 3.14159265358979323846;
 
 // ============================================================================
-// Node definition
+// DataProcessorNode Controller
 // ============================================================================
+// This class owns the live ROS 2 controller node: setup, worker loop,
+// waypoint tracking, adaptive RBF update, and thruster output.
 
 class DataProcessorNode : public rclcpp::Node
 {
@@ -106,55 +111,70 @@ public:
   }
 
 private:
+  enum class LearningPhase {
+    Learning,
+    SteadyRecording,
+    Frozen
+  };
+
+  enum class KnowledgeSource {
+    LocalAverage,
+    SwarmAverage
+  };
+
+  enum class FormationProfile {
+    Training,
+    Rotated
+  };
+
   // --------------------------------------------------------------------------
-  // TF buffer and listener
+  // TF setup
   // --------------------------------------------------------------------------
-  void setup_tf_() { 
+  void setup_tf_() {
     tf_buffer_   = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   }
 
   // --------------------------------------------------------------------------
-  // Rotation matrix for Angular velocity
+  // Body-rate to world Euler-rate transform
   // --------------------------------------------------------------------------
-  Eigen::Matrix3d f_angular_velocity_transform(const geometry_msgs::msg::TransformStamped& tf) 
-  {
-      tf2::Quaternion quat;
-      quat.setW(tf.transform.rotation.w);
-      quat.setX(tf.transform.rotation.x);
-      quat.setY(tf.transform.rotation.y);
-      quat.setZ(tf.transform.rotation.z);
+  Eigen::Matrix3d angular_velocity_transform_matrix_(
+      const geometry_msgs::msg::TransformStamped& tf) {
+    tf2::Quaternion quat;
+    quat.setW(tf.transform.rotation.w);
+    quat.setX(tf.transform.rotation.x);
+    quat.setY(tf.transform.rotation.y);
+    quat.setZ(tf.transform.rotation.z);
 
-      Eigen::Vector3d orientation;
-      tf2::Matrix3x3(quat).getRPY(orientation.x(), orientation.y(), orientation.z());
+    Eigen::Vector3d rpy;
+    tf2::Matrix3x3(quat).getRPY(rpy.x(), rpy.y(), rpy.z());
 
-      Eigen::Matrix3d transform = Eigen::Matrix3d::Zero();
+    Eigen::Matrix3d transform = Eigen::Matrix3d::Zero();
 
-      double cosy = cos(orientation.y());
-      double tany = tan(orientation.y());
+    double cos_pitch = std::cos(rpy.y());
+    double tan_pitch = std::tan(rpy.y());
 
-      if(cosy >-0.0001 && cosy <0.0001)
-      {
-          cosy = 0.0001;
-      }
+    if (cos_pitch > -0.0001 && cos_pitch < 0.0001) {
+      cos_pitch = 0.0001;
+    }
 
-      tany = std::min(std::max(tany, -1000.0), 1000.0);
+    tan_pitch = std::clamp(tan_pitch, -1000.0, 1000.0);
 
-      transform(0,0) = 1.0;
-      transform(0,1) = sin(orientation.x()) * tany;
-      transform(0,2) = cos(orientation.x()) * tany;
-      transform(1,0) = 0.0;
-      transform(1,1) = cos(orientation.x());
-      transform(1,2) = -sin(orientation.x());
-      transform(2,0) = 0.0;
-      transform(2,1) = sin(orientation.x()) / cosy;
-      transform(2,2) = cos(orientation.x()) / cosy;
+    transform(0,0) = 1.0;
+    transform(0,1) = std::sin(rpy.x()) * tan_pitch;
+    transform(0,2) = std::cos(rpy.x()) * tan_pitch;
+    transform(1,0) = 0.0;
+    transform(1,1) = std::cos(rpy.x());
+    transform(1,2) = -std::sin(rpy.x());
+    transform(2,0) = 0.0;
+    transform(2,1) = std::sin(rpy.x()) / cos_pitch;
+    transform(2,2) = std::cos(rpy.x()) / cos_pitch;
 
-      return transform;
+    return transform;
   }
 
   // --------------------------------------------------------------------------
-  // Parameters
+  // Parameter loading
   // --------------------------------------------------------------------------
   void setup_params_() {
     global_frame_ = this->declare_parameter<std::string>("global_frame", ""); 
@@ -162,13 +182,50 @@ private:
     offset_y_ = this->declare_parameter<double>("offset_y", 0.0);
     offset_z_ = this->declare_parameter<double>("offset_z", 0.0);
     offset_pitch_ = this->declare_parameter<double>("offset_pitch", 0.0);
+    rotated_offset_x_ = this->declare_parameter<double>("rotated_offset_x", offset_x_);
+    rotated_offset_y_ = this->declare_parameter<double>("rotated_offset_y", offset_y_);
+    rotated_offset_z_ = this->declare_parameter<double>("rotated_offset_z", offset_z_);
+    rotated_offset_pitch_ =
+      this->declare_parameter<double>("rotated_offset_pitch", offset_pitch_);
+    neighbor_names_ = this->declare_parameter<std::vector<std::string>>(
+      "neighbor_names", std::vector<std::string>{});
 
-    // RBF / grid params
-    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 4);
+    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 5);
     lambda_   = this->declare_parameter<double>("lambda", 0.2);
+    const int steady_record_stride =
+      static_cast<int>(this->declare_parameter<int>("steady_record_stride", 10));
+    steady_record_stride_ = static_cast<std::size_t>(
+      std::max(1, steady_record_stride));
 
-    // // Freeze-learning / init weights
-    // wbar_bin_path_ = this->declare_parameter<std::string>("wbar_bin_path","/home/soslab-p330/ros2_ws/wbar.bin");
+    const std::string learning_phase_name =
+      this->declare_parameter<std::string>("learning_phase", "learning");
+    if (!parse_learning_phase_(learning_phase_name, learning_phase_)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Invalid initial learning_phase '%s'. Falling back to 'learning'.",
+        learning_phase_name.c_str());
+      learning_phase_ = LearningPhase::Learning;
+    }
+
+    const std::string knowledge_source_name =
+      this->declare_parameter<std::string>("knowledge_source", "local_average");
+    if (!parse_knowledge_source_(knowledge_source_name, knowledge_source_)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Invalid initial knowledge_source '%s'. Falling back to 'local_average'.",
+        knowledge_source_name.c_str());
+      knowledge_source_ = KnowledgeSource::LocalAverage;
+    }
+
+    const std::string formation_profile_name =
+      this->declare_parameter<std::string>("formation_profile", "training");
+    if (!parse_formation_profile_(formation_profile_name, formation_profile_)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Invalid initial formation_profile '%s'. Falling back to 'training'.",
+        formation_profile_name.c_str());
+      formation_profile_ = FormationProfile::Training;
+    }
 
     // Scaling values
     scale_pos_    = this->declare_parameter<double>("scale_pos",    scale_pos_);
@@ -182,16 +239,12 @@ private:
     auto hi = this->declare_parameter<std::vector<double>>(
          "rbf_hi8", std::vector<double>(8,  1.0));
 
-    // safety check
     if (lo.size() != 8 || hi.size() != 8) {
-      // Print the error
       RCLCPP_ERROR(get_logger(),
         "rbf_lo8 and rbf_hi8 must each have exactly 8 elements. Got lo=%zu hi=%zu. Using defaults.",
         lo.size(), hi.size()); 
-
-        // Resets both to safe defaults
-        lo.assign(8, -1.0);
-        hi.assign(8,  1.0);
+      lo.assign(8, -1.0);
+      hi.assign(8,  1.0);
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -199,91 +252,97 @@ private:
       rbf_hi8_[i] = static_cast<float>(hi[i]);
     }
 
-    // ****************************************************************************
-    // Frames: we parametrize the global frame, but auto-detect odom from messages.
-    // global_frame_ ~ "mauv_1/world"
-    // ****************************************************************************
+    apply_formation_profile_();
+
+    parameter_callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&DataProcessorNode::on_parameters_set_, this, _1));
   }
   
   // --------------------------------------------------------------------------
-  // Input / output (ROS interfaces)
+  // ROS interfaces
   // --------------------------------------------------------------------------
   void setup_io_() {
+    const auto latched_qos =
+      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
                 "odometry/filtered",
                 rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
                 std::bind(&DataProcessorNode::odom_callback, this, _1)); 
 
-    // Publishers for P_world, p_ , and weights
     pub_world_odom_  = this->create_publisher<nav_msgs::msg::Odometry>("world_odom", 10);
     pub_wp_odom_     = this->create_publisher<nav_msgs::msg::Odometry>("waypoint_odom", 10);
     pub_z1_odom_     = this->create_publisher<nav_msgs::msg::Odometry>("z1_odom", 10);
     pub_pi_p_        = this->create_publisher<nav_msgs::msg::Odometry>("pi_p", 10);
     pub_W_           = this->create_publisher<std_msgs::msg::Float32MultiArray>("rbf_weights", 10);
     pub_w_norms_     = this->create_publisher<std_msgs::msg::Float32MultiArray>("rbf_weight_norms", 10);
+    pub_local_frozen_wbar_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+      "local_frozen_wbar", latched_qos);
     pub_z1_ang_      = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("z1_ang", 10);
     pub_actual_rpy_  = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("actual_rpy", 10);
     pub_desired_rpy_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("desired_rpy", 10);
 
-    // ************************************************************
-    // Note: "odometry/filtered" is a topic name, not a frame name.
-    // ************************************************************
+    sub_shared_wbar_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+      "/swarm/shared_wbar",
+      latched_qos,
+      std::bind(&DataProcessorNode::shared_wbar_callback_, this, _1));
+
+    for (const auto& neighbor_name : neighbor_names_) {
+      const std::string topic_name = "/" + neighbor_name + "/rbf_weights";
+      auto sub = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+        topic_name,
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+        [this, neighbor_name](const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+          this->neighbor_weights_callback_(neighbor_name, msg);
+        });
+
+      neighbor_weight_subs_.push_back(sub);
+      RCLCPP_INFO(get_logger(), "Subscribed to neighbor weights: %s", topic_name.c_str());
+    }
   }
 
   // --------------------------------------------------------------------------
-  // Math and controller setup
+  // Controller and RBF initialization
   // --------------------------------------------------------------------------
   void setup_math_() {
-    // Waypoint dynamics (leader) in [X, Y, Z, Pitch] 
-    // Ensure clean zeros first
     A10_.fill(0.0);
     A0_.fill(0.0);
     B0_.fill(0.0);
 
-    // A10_  
     A10_[WX*4 + WX]         = 1.0;
     A10_[WY*4 + WY]         = 1.0;
     A10_[WZ*4 + WZ]         = 1.0;
     A10_[WPITCH*4 + WPITCH] = 1.0;
 
-    // A0_ 
     A0_[WZ*4 + WZ]         = -kd_z;       
     A0_[WPITCH*4 + WPITCH] = -zeta_pitch;
 
-    // B0_ 
     B0_[WX*4 + WX]         = -wx*wx;         // X'' = -wx^2 X
     B0_[WY*4 + WY]         = -wy*wy;         // Y'' = -wy^2 Y
     B0_[WZ*4 + WZ]         = -kp_z;          // Z'' += -kp_z * Z
     B0_[WPITCH*4 + WPITCH] = -w_pitch;       // Pitch'' += -w_pitch * Pitch
 
-    // Controller / model matrices & gains 
     H1_.fill(0.0);
     H2_.fill(0.0);
 
-    // H1: position → virtual velocity (acts like a position gain inside z2)
-    H1_[WX*4 + WX]         = 1.0; //0.5
+    // H1: position -> virtual velocity.
+    H1_[WX*4 + WX]         = 1.0;
     H1_[WYAW *4 + WYAW ]   = 1.0;   
     H1_[WZ*4 + WZ]         = 1.0;   
     H1_[WPITCH*4 + WPITCH] = 1.0;    
 
-    // H2: velocity error → τ  (damping + position gain)
-    H2_[WX*4 + WX]         = 200.0; //20.0
+    // H2: velocity error -> control effort.
+    H2_[WX*4 + WX]         = 200.0;
     H2_[WYAW *4 + WYAW ]   = 200.0;  
     H2_[WZ*4 + WZ]         = 300.0;  
     H2_[WPITCH*4 + WPITCH] = 100.0;
 
-    // Initial conditions for the waypoint generator
-    // circle
-    // const std::array<double,4> q0  = { 0.0, 10, z_ref, 0.0}; //z_ref
-    // const std::array<double,4> qd0 = { 0.1, 0.0, 0.0, 0.0 }; 
-
-    // // Number "8" trajectory
+    // Initial conditions for the figure-eight waypoint generator.
     const double A = 100.0;   // X amplitude (meters)
     const double B = 50.0;    // Y amplitude (meters)
-    const std::array<double,4> q0  = { 0.0, 0.0, z_ref, 0.0 };   // start at origin in XY
+    const std::array<double,4> q0  = { 0.0, 0.0, z_ref_initial_, 0.0 };
     const std::array<double,4> qd0 = { A*wx, B*wy, 0.0, 0.0};      
 
-    // Waypoint states 
     for (int i=0; i<4; ++i) {
       X_waypoint_[i]    = q0[i];
       X_waypoint_[4+i]  = qd0[i];
@@ -291,92 +350,52 @@ private:
       v_[i] = X_waypoint_[4 + i];
     }
 
-    // GPU helper (RBF)
-    // rbf_ = std::make_unique<CudaRBF>(zetta_ne_, rbf_lo_, rbf_hi_, (float)lambda_);
     float lo8[8], hi8[8];
     for (int i = 0; i < 8; ++i) {
       lo8[i] = rbf_lo8_[i];
       hi8[i] = rbf_hi8_[i];
     } 
 
-    // Create RBF
     rbf_ = std::make_unique<CudaRBF>(zetta_ne_, lo8, hi8, (float)lambda_);
-
-    // // ---- ALWAYS load W from .bin (quick test) ----
-    // if (wbar_bin_path_.empty()) {
-    //   RCLCPP_WARN(get_logger(), "wbar_bin_path is empty -> using default-initialized weights");
-    // } else {
-    //   const uint64_t N = rbf_->num_points();
-    //   const size_t expected_bytes = size_t(4) * size_t(N) * sizeof(float);
-
-    //   // optional sanity check
-    //   try {
-    //     auto fs = std::filesystem::file_size(wbar_bin_path_);
-    //     if (fs != expected_bytes) {
-    //       RCLCPP_ERROR(get_logger(),
-    //         "wbar file size mismatch: got %llu bytes, expected %zu bytes (4*N floats).",
-    //         (unsigned long long)fs, expected_bytes);
-    //     }
-    //   } catch (...) {
-    //     RCLCPP_WARN(get_logger(), "Could not read file size for %s", wbar_bin_path_.c_str());
-    //   }
-
-    //   std::vector<float> W(4 * N);
-    //   std::ifstream f(wbar_bin_path_, std::ios::binary);
-    //   if (!f) {
-    //     RCLCPP_ERROR(get_logger(), "Failed to open wbar file: %s", wbar_bin_path_.c_str());
-    //   } else {
-    //     f.read(reinterpret_cast<char*>(W.data()), expected_bytes);
-    //     if (!f) {
-    //       RCLCPP_ERROR(get_logger(), "Failed to read full wbar (short read / mismatch)");
-    //     } else {
-    //       auto err = rbf_->upload_W(W.data());
-    //       if (err != cudaSuccess) {
-    //         RCLCPP_ERROR(get_logger(), "upload_W failed: %s", cudaGetErrorString(err));
-    //       } else {
-    //         RCLCPP_INFO(get_logger(), "Loaded initial weights from %s", wbar_bin_path_.c_str());
-    //       }
-    //     }
-    //   }
-    // }
-
-
-    // Log RBF memory footprint
     uint64_t N = 1;
     for (int i = 0; i < 8; ++i) N *= static_cast<uint64_t>(zetta_ne_);
     double mb = static_cast<double>(N) * sizeof(float) / (1024.0*1024.0);
     RCLCPP_INFO(this->get_logger(), "RBF: ne=%d -> N=ne^8=%llu (%.2f MB buffer)",
                 zetta_ne_, static_cast<unsigned long long>(N), mb);
 
-    // if (!rbf_ || !rbf_->ready()) {
-    //   RCLCPP_ERROR(this->get_logger(),
-    //     "CUDA RBF allocation failed: ne=%d N=%llu bytes=%zu cudaError=%s",
-    //     zetta_ne_,
-    //     static_cast<unsigned long long>(rbf_ ? rbf_->num_points() : 0ULL),
-    //     static_cast<size_t>(rbf_ ? rbf_->bytes_S() : 0),
-    //     cudaGetErrorString(rbf_ ? rbf_->last_status() : cudaErrorUnknown));
-    //   } 
-    // else {
-    //   RCLCPP_INFO(this->get_logger(), "CUDA RBF ready: N=%llu (ne=%d)",
-    //     static_cast<unsigned long long>(rbf_->num_points()), zetta_ne_);
-    //   }
+    if (learning_phase_ == LearningPhase::SteadyRecording) {
+      begin_steady_recording_();
+    } else if (learning_phase_ == LearningPhase::Frozen) {
+      if (knowledge_source_ == KnowledgeSource::SwarmAverage) {
+        RCLCPP_INFO(
+          get_logger(),
+          "Starting in 'frozen' mode with shared swarm knowledge. "
+          "Waiting for /swarm/shared_wbar if it has not arrived yet.");
+      } else {
+        RCLCPP_WARN(
+          get_logger(),
+          "Initial learning_phase 'frozen' requires knowledge_source="
+          "'swarm_average' when reusing saved weights. Starting in "
+          "'learning' mode instead.");
+        learning_phase_ = LearningPhase::Learning;
+        this->set_parameter(rclcpp::Parameter("learning_phase", "learning"));
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
-  // Worker thread (a second thread for running processing_loop)
+  // Worker thread startup
   // --------------------------------------------------------------------------
   void start_worker_() {   
     processing_thread_ = std::thread(&DataProcessorNode::processing_loop, this);
   }
 
   // --------------------------------------------------------------------------
-  // Odometry callback
+  // Odometry input
   // --------------------------------------------------------------------------
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
-    // Cache the newest odometry and learn the frame name to use in processing loop 
-    // s is a local variable and after the callback ends, it disappears
-    FullState s;     // make one box called s, and that box has the shape/type FullState
+    FullState s;
     s.stamp          = rclcpp::Time(msg->header.stamp);
     s.frame_id       = msg->header.frame_id;         // e.g., "mauv_1/odom"
     s.child_frame_id = msg->child_frame_id;          // e.g., "mauv_1/base_link"
@@ -385,28 +404,21 @@ private:
     s.lin_vel        = msg->twist.twist.linear;      // in body frame (base_link)
     s.ang_vel        = msg->twist.twist.angular;     // in body frame (base_link)
 
-    // Only one thread touches latest_state_ at a time
     {    
       std::lock_guard<std::mutex> lk(state_mutex_); 
       latest_state_ = s;
     } 
 
-    // Capture odom frame name again (it is redundant, but it improves clarity and readability)
     odom_frame_ = msg->header.frame_id;
 
-    // Capture base frame and TF prefix
     if (base_frame_.empty()) {
         base_frame_ = msg->child_frame_id;     // "mauv_1/base_link" or just "base_link"
         auto slash = base_frame_.find('/');              
         tf_prefix_ = (slash == std::string::npos) 
                       ? ""   // no prefix present
                       : base_frame_.substr(0, slash); // "mauv_1"
-        // RCLCPP_INFO(get_logger(), 
-        //             "Base frame: %s | TF prefix: %s",
-        //             base_frame_.c_str(), tf_prefix_.c_str());
       }
 
-    // create thruster publishers once we know the prefix
     if (!pub_heave_bow_) {
       const std::string ns = tf_prefix_.empty() ? "" : ("/" + tf_prefix_);
       pub_heave_bow_   = 
@@ -417,18 +429,527 @@ private:
           this->create_publisher<std_msgs::msg::Float64>(ns + "/control/thruster/surge", 10);
       pub_sway_bow_    = 
           this->create_publisher<std_msgs::msg::Float64>(ns + "/control/thruster/sway_bow", 10);
-     
-      // RCLCPP_INFO(get_logger(), 
-      //             "Thruster publishers created on namespace '%s'", ns.c_str());
     }
   }
 
   // --------------------------------------------------------------------------
-  // Global frame auto-detection
+  // Cooperative weight input
+  // --------------------------------------------------------------------------
+  void neighbor_weights_callback_(
+      const std::string& neighbor_name,
+      const std_msgs::msg::Float32MultiArray::SharedPtr msg)
+  {
+    {
+      std::lock_guard<std::mutex> lk(neighbor_weights_mutex_);
+      neighbor_weights_[neighbor_name] = msg->data;
+      neighbor_weight_stamps_[neighbor_name] = this->get_clock()->now();
+    }
+
+    const uint64_t expected_size = expected_weight_vector_size_();
+    if (msg->data.size() != expected_size) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Neighbor '%s' weight size mismatch: got=%zu expected=%llu",
+        neighbor_name.c_str(),
+        msg->data.size(),
+        static_cast<unsigned long long>(expected_size));
+    } else {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 10000,
+        "Received neighbor weights from '%s' (size=%zu)",
+        neighbor_name.c_str(),
+        msg->data.size());
+    }
+
+    bool all_neighbors_ready = false;
+    {
+      std::lock_guard<std::mutex> lk(neighbor_weights_mutex_);
+      all_neighbors_ready = (neighbor_weights_.size() == neighbor_names_.size());
+    }
+
+    if (all_neighbors_ready) {
+      RCLCPP_INFO_ONCE(
+        get_logger(),
+        "Received at least one rbf_weights message from all configured neighbors.");
+    }
+  }
+
+  uint64_t expected_weight_vector_size_() const
+  {
+    uint64_t N = 1;
+    for (int i = 0; i < 8; ++i) {
+      N *= static_cast<uint64_t>(zetta_ne_);
+    }
+    return 4 * N;
+  }
+
+  static const char* knowledge_source_to_string_(KnowledgeSource source)
+  {
+    switch (source) {
+      case KnowledgeSource::LocalAverage:
+        return "local_average";
+      case KnowledgeSource::SwarmAverage:
+        return "swarm_average";
+    }
+    return "local_average";
+  }
+
+  static bool parse_knowledge_source_(
+      const std::string& source_name,
+      KnowledgeSource& source)
+  {
+    if (source_name == "local_average") {
+      source = KnowledgeSource::LocalAverage;
+      return true;
+    }
+    if (source_name == "swarm_average") {
+      source = KnowledgeSource::SwarmAverage;
+      return true;
+    }
+    return false;
+  }
+
+  static const char* formation_profile_to_string_(FormationProfile profile)
+  {
+    switch (profile) {
+      case FormationProfile::Training:
+        return "training";
+      case FormationProfile::Rotated:
+        return "rotated";
+    }
+    return "training";
+  }
+
+  static bool parse_formation_profile_(
+      const std::string& profile_name,
+      FormationProfile& profile)
+  {
+    if (profile_name == "training") {
+      profile = FormationProfile::Training;
+      return true;
+    }
+    if (profile_name == "rotated") {
+      profile = FormationProfile::Rotated;
+      return true;
+    }
+    return false;
+  }
+
+  static const char* learning_phase_to_string_(LearningPhase phase)
+  {
+    switch (phase) {
+      case LearningPhase::Learning:
+        return "learning";
+      case LearningPhase::SteadyRecording:
+        return "steady_recording";
+      case LearningPhase::Frozen:
+        return "frozen";
+    }
+    return "learning";
+  }
+
+  static bool parse_learning_phase_(
+      const std::string& phase_name,
+      LearningPhase& phase)
+  {
+    if (phase_name == "learning") {
+      phase = LearningPhase::Learning;
+      return true;
+    }
+    if (phase_name == "steady_recording") {
+      phase = LearningPhase::SteadyRecording;
+      return true;
+    }
+    if (phase_name == "frozen") {
+      phase = LearningPhase::Frozen;
+      return true;
+    }
+    return false;
+  }
+
+  void apply_formation_profile_()
+  {
+    switch (formation_profile_) {
+      case FormationProfile::Training:
+        active_offset_x_ = offset_x_;
+        active_offset_y_ = offset_y_;
+        active_offset_z_ = offset_z_;
+        active_offset_pitch_ = offset_pitch_;
+        break;
+
+      case FormationProfile::Rotated:
+        active_offset_x_ = rotated_offset_x_;
+        active_offset_y_ = rotated_offset_y_;
+        active_offset_z_ = rotated_offset_z_;
+        active_offset_pitch_ = rotated_offset_pitch_;
+        break;
+    }
+  }
+
+  void shared_wbar_callback_(
+      const std_msgs::msg::Float32MultiArray::SharedPtr msg)
+  {
+    const std::size_t expected_size =
+      static_cast<std::size_t>(expected_weight_vector_size_());
+    if (msg->data.size() != expected_size) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Shared swarm w_bar size mismatch: got=%zu expected=%zu",
+        msg->data.size(),
+        expected_size);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(shared_wbar_mutex_);
+      shared_frozen_weights_host_ = msg->data;
+      shared_weights_ready_ = true;
+      shared_weights_dirty_ = true;
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 10000,
+      "Received shared swarm w_bar (size=%zu).",
+      msg->data.size());
+  }
+
+  rcl_interfaces::msg::SetParametersResult on_parameters_set_(
+      const std::vector<rclcpp::Parameter>& parameters)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    for (const auto& parameter : parameters) {
+      if (parameter.get_name() == "learning_phase") {
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
+          result.successful = false;
+          result.reason = "learning_phase must be a string.";
+          return result;
+        }
+
+        LearningPhase requested_phase = LearningPhase::Learning;
+        if (!parse_learning_phase_(parameter.as_string(), requested_phase)) {
+          result.successful = false;
+          result.reason =
+            "learning_phase must be one of: learning, steady_recording, frozen.";
+          return result;
+        }
+
+        std::lock_guard<std::mutex> lk(runtime_update_mutex_);
+        pending_learning_phase_ = requested_phase;
+        has_pending_learning_phase_ = true;
+      }
+
+      if (parameter.get_name() == "knowledge_source") {
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
+          result.successful = false;
+          result.reason = "knowledge_source must be a string.";
+          return result;
+        }
+
+        KnowledgeSource requested_source = KnowledgeSource::LocalAverage;
+        if (!parse_knowledge_source_(parameter.as_string(), requested_source)) {
+          result.successful = false;
+          result.reason =
+            "knowledge_source must be one of: local_average, swarm_average.";
+          return result;
+        }
+
+        std::lock_guard<std::mutex> lk(runtime_update_mutex_);
+        pending_knowledge_source_ = requested_source;
+        has_pending_knowledge_source_ = true;
+      }
+
+      if (parameter.get_name() == "formation_profile") {
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
+          result.successful = false;
+          result.reason = "formation_profile must be a string.";
+          return result;
+        }
+
+        FormationProfile requested_profile = FormationProfile::Training;
+        if (!parse_formation_profile_(parameter.as_string(), requested_profile)) {
+          result.successful = false;
+          result.reason =
+            "formation_profile must be one of: training, rotated.";
+          return result;
+        }
+
+        std::lock_guard<std::mutex> lk(runtime_update_mutex_);
+        pending_formation_profile_ = requested_profile;
+        has_pending_formation_profile_ = true;
+      }
+
+    }
+
+    return result;
+  }
+
+  void begin_steady_recording_()
+  {
+    const std::size_t weight_count =
+      static_cast<std::size_t>(expected_weight_vector_size_());
+    steady_weight_sum_.assign(weight_count, 0.0);
+    steady_weight_snapshot_.clear();
+    frozen_weights_host_.clear();
+    steady_sample_count_ = 0;
+    steady_record_tick_ = 0;
+    frozen_weights_ready_ = false;
+    learning_phase_ = LearningPhase::SteadyRecording;
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Learning phase switched to 'steady_recording'. Recording weight "
+      "samples every %zu control step(s).",
+      steady_record_stride_);
+  }
+
+  void publish_local_frozen_wbar_()
+  {
+    if (!pub_local_frozen_wbar_ || frozen_weights_host_.empty()) {
+      return;
+    }
+
+    std_msgs::msg::Float32MultiArray msg;
+    msg.layout.dim.resize(2);
+    msg.layout.dim[0].label = "output";
+    msg.layout.dim[0].size = 4;
+    msg.layout.dim[0].stride =
+      static_cast<uint32_t>(frozen_weights_host_.size());
+    msg.layout.dim[1].label = "rbf";
+    msg.layout.dim[1].size =
+      static_cast<uint32_t>(frozen_weights_host_.size() / 4);
+    msg.layout.dim[1].stride =
+      static_cast<uint32_t>(frozen_weights_host_.size() / 4);
+    msg.data = frozen_weights_host_;
+    pub_local_frozen_wbar_->publish(msg);
+  }
+
+  void record_steady_weight_sample_()
+  {
+    if (learning_phase_ != LearningPhase::SteadyRecording) {
+      return;
+    }
+
+    if (steady_record_tick_++ % steady_record_stride_ != 0) {
+      return;
+    }
+
+    const std::size_t weight_count =
+      static_cast<std::size_t>(expected_weight_vector_size_());
+    if (steady_weight_sum_.size() != weight_count) {
+      steady_weight_sum_.assign(weight_count, 0.0);
+    }
+
+    steady_weight_snapshot_.resize(weight_count);
+    const cudaError_t err = rbf_->download_W(steady_weight_snapshot_.data());
+    if (err != cudaSuccess) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Failed to record steady-phase weights: %s",
+        cudaGetErrorString(err));
+      return;
+    }
+
+    for (std::size_t idx = 0; idx < weight_count; ++idx) {
+      steady_weight_sum_[idx] +=
+        static_cast<double>(steady_weight_snapshot_[idx]);
+    }
+    ++steady_sample_count_;
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 20000,
+      "Steady recording active: %zu sample(s) collected.",
+      steady_sample_count_);
+  }
+
+  bool freeze_to_average_weights_()
+  {
+    if (!(rbf_ && rbf_->ready())) {
+      RCLCPP_WARN(get_logger(), "Cannot freeze learning before the RBF is ready.");
+      return false;
+    }
+
+    if (steady_sample_count_ == 0 || steady_weight_sum_.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Cannot freeze learning: no steady-phase weight samples recorded yet.");
+      return false;
+    }
+
+    const std::size_t weight_count = steady_weight_sum_.size();
+    frozen_weights_host_.resize(weight_count);
+    for (std::size_t idx = 0; idx < weight_count; ++idx) {
+      frozen_weights_host_[idx] = static_cast<float>(
+        steady_weight_sum_[idx] / static_cast<double>(steady_sample_count_));
+    }
+
+    const cudaError_t err = rbf_->upload_W(frozen_weights_host_.data());
+    if (err != cudaSuccess) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Failed to upload averaged frozen weights: %s",
+        cudaGetErrorString(err));
+      return false;
+    }
+
+    frozen_weights_ready_ = true;
+    learning_phase_ = LearningPhase::Frozen;
+    publish_local_frozen_wbar_();
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Learning phase switched to 'frozen' using %zu averaged steady sample(s).",
+      steady_sample_count_);
+    return true;
+  }
+
+  void apply_shared_wbar_if_ready_()
+  {
+    if (!(rbf_ && rbf_->ready())) {
+      return;
+    }
+
+    std::vector<float> shared_weights;
+    {
+      std::lock_guard<std::mutex> lk(shared_wbar_mutex_);
+      if (!shared_weights_ready_) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "Waiting for shared swarm w_bar before applying swarm-average knowledge.");
+        return;
+      }
+
+      if (!shared_weights_dirty_) {
+        return;
+      }
+
+      shared_weights = shared_frozen_weights_host_;
+      shared_weights_dirty_ = false;
+    }
+
+    const std::size_t expected_size =
+      static_cast<std::size_t>(expected_weight_vector_size_());
+    if (shared_weights.size() != expected_size) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Shared swarm w_bar has unexpected size: got=%zu expected=%zu",
+        shared_weights.size(),
+        expected_size);
+      return;
+    }
+
+    const cudaError_t err = rbf_->upload_W(shared_weights.data());
+    if (err != cudaSuccess) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Failed to upload shared swarm w_bar: %s",
+        cudaGetErrorString(err));
+      return;
+    }
+
+    shared_weights_active_ = true;
+    RCLCPP_INFO(
+      get_logger(),
+      "Applied shared swarm w_bar to the local controller.");
+  }
+
+  void apply_pending_runtime_updates_()
+  {
+    LearningPhase requested_phase = learning_phase_;
+    KnowledgeSource requested_source = knowledge_source_;
+    FormationProfile requested_profile = formation_profile_;
+    bool has_pending_phase = false;
+    bool has_pending_source = false;
+    bool has_pending_profile = false;
+
+    {
+      std::lock_guard<std::mutex> lk(runtime_update_mutex_);
+      has_pending_phase = has_pending_learning_phase_;
+      has_pending_source = has_pending_knowledge_source_;
+      has_pending_profile = has_pending_formation_profile_;
+
+      requested_phase = pending_learning_phase_;
+      requested_source = pending_knowledge_source_;
+      requested_profile = pending_formation_profile_;
+
+      has_pending_learning_phase_ = false;
+      has_pending_knowledge_source_ = false;
+      has_pending_formation_profile_ = false;
+    }
+
+    if (has_pending_profile && requested_profile != formation_profile_) {
+      formation_profile_ = requested_profile;
+      apply_formation_profile_();
+      RCLCPP_INFO(
+        get_logger(),
+        "Formation profile switched to '%s'.",
+        formation_profile_to_string_(formation_profile_));
+    }
+
+    if (has_pending_phase && requested_phase != learning_phase_) {
+      switch (requested_phase) {
+        case LearningPhase::Learning:
+          learning_phase_ = LearningPhase::Learning;
+          shared_weights_active_ = false;
+          RCLCPP_INFO(get_logger(), "Learning phase switched to 'learning'.");
+          break;
+
+        case LearningPhase::SteadyRecording:
+          begin_steady_recording_();
+          break;
+
+        case LearningPhase::Frozen:
+          if (!freeze_to_average_weights_()) {
+            this->set_parameter(rclcpp::Parameter(
+              "learning_phase",
+              learning_phase_to_string_(learning_phase_)));
+          }
+          break;
+      }
+    }
+
+    if (has_pending_source && requested_source != knowledge_source_) {
+      knowledge_source_ = requested_source;
+      RCLCPP_INFO(
+        get_logger(),
+        "Knowledge source switched to '%s'.",
+        knowledge_source_to_string_(knowledge_source_));
+
+      if (learning_phase_ == LearningPhase::Frozen) {
+        if (knowledge_source_ == KnowledgeSource::LocalAverage) {
+          if (frozen_weights_ready_ && !frozen_weights_host_.empty()) {
+            const cudaError_t err = rbf_->upload_W(frozen_weights_host_.data());
+            if (err != cudaSuccess) {
+              RCLCPP_ERROR(
+                get_logger(),
+                "Failed to restore local frozen w_bar: %s",
+                cudaGetErrorString(err));
+            } else {
+              shared_weights_active_ = false;
+            }
+          } else {
+            RCLCPP_WARN(
+              get_logger(),
+              "Local frozen w_bar is not ready yet; cannot switch to local_average.");
+          }
+        } else {
+          apply_shared_wbar_if_ready_();
+        }
+      }
+    }
+
+    if (learning_phase_ == LearningPhase::Frozen &&
+        knowledge_source_ == KnowledgeSource::SwarmAverage) {
+      apply_shared_wbar_if_ready_();
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Global frame discovery
   // --------------------------------------------------------------------------
   void try_auto_global_frame_() 
   {
-    // Check if already set
     if (global_frame_.size()) {
       return; 
     }
@@ -442,7 +963,6 @@ private:
       }
     }
 
-    // Add world to the derived prefix
     std::vector<std::string> candidates;
     if (!prefix.empty()) {
       candidates = {
@@ -450,7 +970,6 @@ private:
       };
     }
     
-    // Also add "world" as another possible frame name in the list of candidates
     candidates.insert(candidates.end(), {"world"}); 
     
     for (const auto& f : candidates) {
@@ -465,17 +984,13 @@ private:
       }
     }
 
-    // If nothing works, fall back to odom (so the node can still run)
     if (!odom_frame_.empty()) {
       global_frame_ = odom_frame_;
-      // RCLCPP_WARN(get_logger(), get_clock(), 50000,
-      //   "Could not auto-detect a global frame; falling back to odom_frame '%s'.",
-      //   global_frame_.c_str());
     }
   }
 
   // --------------------------------------------------------------------------
-  // Processing loop (runs in worker thread)
+  // Worker loop
   // --------------------------------------------------------------------------
   void processing_loop() {
     rclcpp::Rate rate(10); // 10 Hz
@@ -486,11 +1001,11 @@ private:
   }
 
   // --------------------------------------------------------------------------
-  // Thruster allocation: solve B_sub * f = tau (4x4 system)
+  // Thruster allocation solver
   // --------------------------------------------------------------------------
   bool solve_thruster_forces_ls_(const double tau[4], double f_out[4]) {
     
-    // Build augmented matrix: A = [B_sub | tau]: 
+    // Build augmented matrix A = [B_sub | tau].
     double A[4][5];
     for (int j = 0; j < 4; ++j) {
       A[0][j]  = B_[X][j];     // Fx 
@@ -529,7 +1044,6 @@ private:
         A[col][j] /= diag;
       }
 
-      // eliminate below
       for (int r = col + 1; r < 4; ++r) {
         double factor = A[r][col];
         if (factor == 0.0) {
@@ -548,292 +1062,298 @@ private:
       f_out[i] = s;  //  diagonal is 1: (A[i][i] = 1)
     }
     return true;
-
-    // *************************************************************************************
-    // B_ = [ d ; r × d ]: Thruster's force applied to CG of the AUV expressed in body frame
-    // B_sub uses rows: (0,1,2,4) of B_ corresponding to: Fx, Mz, Fz, My
-    // B_sub*f = tau (Solving system of linear algebraic equations) --->
-    //    Augmented matrix: A = [B_ | tau]: 
-    //      * 4 rows: Fx, Mz, Fz, My
-    //      * 5 columns: 4 Thrusters (we should solve) + tau (commanded by the controller)
-    //    Solve 4 equations 4 unknowns --> T1, T2, T3, T4
-    // **************************************************************************************
   }
 
   // --------------------------------------------------------------------------
-  // Main per-step processing
+  // Per-step data types and helpers
   // --------------------------------------------------------------------------
-  void process_data()
-  {
-    // Time step
-    rclcpp::Time now = this->get_clock()->now();
-    double dt = (last_step_.nanoseconds() == 0) 
-                  ? 0.1 
+
+  struct WorldFrameState {
+    FullState raw_state;
+    std::array<double, 6> pose{};
+    std::array<double, 6> twist{};
+    tf2::Matrix3x3 rotation_world_from_body;
+    Eigen::Matrix3d euler_rate_transform;
+  };
+
+  struct HeadingReference {
+    double path_heading{0.0};
+    double heading_correction{0.0};
+    double desired_roll{0.0};
+    double desired_pitch{0.0};
+    double desired_yaw{0.0};
+    double desired_yaw_rate{0.0};
+    double cross_track_error{0.0};
+  };
+
+  double compute_step_dt_() {
+    const rclcpp::Time now = this->get_clock()->now();
+    double dt = (last_step_.nanoseconds() == 0)
+                  ? 0.1
                   : (now - last_step_).seconds();
     if (dt <= 0.0 || dt > 1.0) {
       dt = 0.1;
     }
     last_step_ = now;
+    return dt;
+  }
 
-    // Integrate waypoint generator (simple ODE)
+  void update_waypoint_reference_(double dt) {
     rk4_step(sim_time_, dt, X_waypoint_);
     sim_time_ += dt;
-    for (int i = 0; i < 4; ++i) { 
-      p_[i] = X_waypoint_[i]; 
+
+    for (int i = 0; i < 4; ++i) {
+      p_[i] = X_waypoint_[i];
       v_[i] = X_waypoint_[4 + i];
     }
 
-    // Local desired reference = common leader trajectory + constant formation offset
-    p_ref_[WX]     = p_[WX] + offset_x_;
-    p_ref_[WY]     = p_[WY] + offset_y_;
-    p_ref_[WZ]     = p_[WZ] + offset_z_;
-    p_ref_[WPITCH] = p_[WPITCH] + offset_pitch_;
+    p_ref_[WX] = p_[WX] + active_offset_x_;
+    p_ref_[WY] = p_[WY] + active_offset_y_;
+    p_ref_[WZ] = p_[WZ] + active_offset_z_;
+    p_ref_[WPITCH] = p_[WPITCH] + active_offset_pitch_;
 
-    // Since the offsets are constant, desired velocity = leader velocity
-    v_ref_local_[WX]     = v_[WX];
-    v_ref_local_[WY]     = v_[WY];
-    v_ref_local_[WZ]     = v_[WZ];
+    v_ref_local_[WX] = v_[WX];
+    v_ref_local_[WY] = v_[WY];
+    v_ref_local_[WZ] = v_[WZ];
     v_ref_local_[WPITCH] = v_[WPITCH];
+  }
 
-    // Need an odom frame before TF lookup
+  bool ensure_frames_ready_() {
     if (odom_frame_.empty()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 50000,
         "Waiting for first odom message to learn odom frame...");
-      return;
+      return false;
     }
 
-    // Auto-detect global frame if needed
     if (global_frame_.empty()) {
       try_auto_global_frame_();
       if (global_frame_.empty()) {
-        RCLCPP_WARN_THROTTLE(get_logger(), 
-          *get_clock(), 50000,
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 50000,
           "Still auto-detecting global frame (have odom='%s').",
           odom_frame_.c_str());
-        return;  
+        return false;
       }
-      // ************************************************
-      // Note: don't proceed until having a global frame
-      // ************************************************
     }
 
-    RCLCPP_INFO_ONCE(get_logger(), 
-                     "Using global_frame = '%s'", global_frame_.c_str());
+    RCLCPP_INFO_ONCE(
+      get_logger(), "Using global_frame = '%s'", global_frame_.c_str());
+    return true;
+  }
 
-    // Copy buffered state
-    FullState s_copy;
-    { 
-      std::lock_guard<std::mutex> lk(state_mutex_); 
-      s_copy = latest_state_;
+  FullState copy_latest_state_() {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    return latest_state_;
+  }
 
-      // ************************************************************** 
-      // 1-Locks state_mutex_ + 2-copy + 3-unlocks when the block ends 
-      // The braces: make the unlock happen immediately after the copy.
-      // **************************************************************
-    } 
+  bool build_world_state_(const FullState& raw_state,
+                          WorldFrameState& world_state) {
+    world_state.raw_state = raw_state;
 
-    // Transform pose from odom → world
-    // 1- create two variables of type geometry_msgs::msg::PoseStamped:
-    geometry_msgs::msg::PoseStamped ps_odom, ps_world;
-    // 2- fill ps_odom
-    ps_odom.header.stamp     = s_copy.stamp;
-    ps_odom.header.frame_id  = odom_frame_;
-    ps_odom.pose.position    = s_copy.position;
-    ps_odom.pose.orientation = s_copy.orientation;
+    geometry_msgs::msg::PoseStamped pose_odom;
+    geometry_msgs::msg::PoseStamped pose_world;
+    pose_odom.header.stamp = raw_state.stamp;
+    pose_odom.header.frame_id = odom_frame_;
+    pose_odom.pose.position = raw_state.position;
+    pose_odom.pose.orientation = raw_state.orientation;
 
     try {
-      auto T_g_o = tf_buffer_->lookupTransform(
-        global_frame_, odom_frame_, s_copy.stamp, tf2::durationFromSec(0.2));
-        // get the transform from odom_frame_ to global_frame_ at the time s_copy.stamp.
-        // T_g_o is the rotation + translation needed to go from odom coordinates to world/global coordinates
-        // geometry_msgs::msg::Quaternion = a ROS message box for carrying quaternion data
-        // tf2::Quaternion = a math tool for working with that quaternion
-
-        // 1) Print translation + quaternion
-        // const auto& tr = T_g_o.transform.translation;
-        // const auto& q  = T_g_o.transform.rotation;
-        // RCLCPP_INFO(this->get_logger(),
-        //   "TF %s <- %s | t = [%.3f %.3f %.3f], q = [%.3f %.3f %.3f %.3f]",
-        //   global_frame_.c_str(), odom_frame_.c_str(),
-        //   tr.x, tr.y, tr.z, q.x, q.y, q.z, q.w);
-
-        // 2) print roll/pitch/yaw
-        // tf2::Quaternion q_go;
-        // tf2::fromMsg(q, q_go);
-        // double r, p, y;
-        // tf2::Matrix3x3(q_go).getRPY(r, p, y);
-        // RCLCPP_INFO(this->get_logger(),
-        //   "TF %s <- %s | RPY = [%.3f %.3f %.3f] rad",
-        //   global_frame_.c_str(), odom_frame_.c_str(), r, p, y);
-
-      tf2::doTransform(ps_odom, ps_world, T_g_o);
-    } 
-    // ps_world just contains header, position and orientation (in world frame) not the lin and ang velocity
-
-    // if the TF lookup fails, catch the error, print a warning, and skip this cycle
-    catch (const tf2::TransformException& ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      const auto transform_global_from_odom = tf_buffer_->lookupTransform(
+        global_frame_, odom_frame_, raw_state.stamp, tf2::durationFromSec(0.2));
+      tf2::doTransform(pose_odom, pose_world, transform_global_from_odom);
+    } catch (const tf2::TransformException& ex) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
         "TF %s<-%s unavailable (%s). Skipping.",
         global_frame_.c_str(), odom_frame_.c_str(), ex.what());
-      return;
+      return false;
     }
 
-    // Pose in world: [x, y, z, roll, pitch, yaw]
-    // ps_world.pose.orientation is a ROS quaternion message
-    // Convert orientation (world frame) quaternion → roll/pitch/yaw
+    tf2::Quaternion q_world_from_body;
+    tf2::fromMsg(pose_world.pose.orientation, q_world_from_body);
 
-    // make a tf2 quaternion variable so we can use tf2 math tools
-    tf2::Quaternion q_wb;  
-    // converts the quaternion from ROS message format into tf2 (math) format
-    tf2::fromMsg(ps_world.pose.orientation, q_wb); 
+    double roll_world = 0.0;
+    double pitch_world = 0.0;
+    double yaw_world = 0.0;
+    tf2::Matrix3x3(q_world_from_body).getRPY(
+      roll_world, pitch_world, yaw_world);
 
-    // converts quaternion to RPY (both math format)
-    double roll_w = 0.0, pitch_w = 0.0, yaw_w = 0.0;
-    tf2::Matrix3x3(q_wb).getRPY(roll_w, pitch_w, yaw_w); 
+    world_state.rotation_world_from_body = tf2::Matrix3x3(q_world_from_body);
 
-    // **************************************************************************
-    // Now we have the position and orientation in world frame:
-    //       ps_world.pose.position.x,
-    //       ps_world.pose.position.y,
-    //       ps_world.pose.position.z,
-    //       roll_w, pitch_w, yaw_w
-    // Now we move forward to extract velocity in world frame
-    // **************************************************************************
-    // computes the equivalent 3×3 rotation matrix from the ROTATION matrix so we could convert the Twist: body → world
-    tf2::Matrix3x3 R_wb(q_wb);   // rotation: world <- base_link, builds the rotation matrix from the quaternion q_wb.
+    const tf2::Vector3 linear_velocity_body(
+      raw_state.lin_vel.x,
+      raw_state.lin_vel.y,
+      raw_state.lin_vel.z);
+    const tf2::Vector3 linear_velocity_world =
+      world_state.rotation_world_from_body * linear_velocity_body;
 
-    tf2::Vector3 v_b(
-      s_copy.lin_vel.x, s_copy.lin_vel.y, s_copy.lin_vel.z);
-    tf2::Vector3 w_b(
-      s_copy.ang_vel.x, s_copy.ang_vel.y, s_copy.ang_vel.z);
+    geometry_msgs::msg::TransformStamped world_from_body_transform;
+    world_from_body_transform.transform.rotation = pose_world.pose.orientation;
+    world_state.euler_rate_transform =
+      angular_velocity_transform_matrix_(world_from_body_transform);
 
-    // **************************************************************************
-    // s_copy.lin_vel and s_copy.ang_vel are given in the body frame (base_link).
-    // R_wb maps vectors expressed in body frame to world frame.
-    // **************************************************************************
+    const Eigen::Vector3d angular_velocity_body(
+      raw_state.ang_vel.x,
+      raw_state.ang_vel.y,
+      raw_state.ang_vel.z);
+    const Eigen::Vector3d euler_rates_world =
+      world_state.euler_rate_transform * angular_velocity_body;
 
-    tf2::Vector3 v_world = R_wb * v_b;   // linear velocity in world frame
-    
-    geometry_msgs::msg::TransformStamped tf_wb_msg;
-    tf_wb_msg.transform.rotation = ps_world.pose.orientation;  // world<-base orientation
-
-    Eigen::Matrix3d T = f_angular_velocity_transform(tf_wb_msg);
-
-    // body angular velocity (p,q,r)
-    Eigen::Vector3d w_body(s_copy.ang_vel.x, s_copy.ang_vel.y, s_copy.ang_vel.z);
-
-    // Euler angle rates: [roll_dot, pitch_dot, yaw_dot]
-    Eigen::Vector3d w_world = T * w_body;
-    
-    // Pack pose and twist in World frame
-    std::array<double,6> P_world = {
-      ps_world.pose.position.x,
-      ps_world.pose.position.y,
-      ps_world.pose.position.z,
-      roll_w, pitch_w, yaw_w
+    world_state.pose = {
+      pose_world.pose.position.x,
+      pose_world.pose.position.y,
+      pose_world.pose.position.z,
+      roll_world,
+      pitch_world,
+      yaw_world
     };
 
-    std::array<double,6> V_world = {
-      v_world.x(), v_world.y(), v_world.z(),
-      w_world(0), w_world(1), w_world(2)   
+    world_state.twist = {
+      linear_velocity_world.x(),
+      linear_velocity_world.y(),
+      linear_velocity_world.z(),
+      euler_rates_world(0),
+      euler_rates_world(1),
+      euler_rates_world(2)
     };
 
-    // ----------------------------------------------------------------------
-    // Desired yaw from "path heading + cross-track" law
-    // ----------------------------------------------------------------------
-    double PI_p_; 
-    const double Delta = 5.0;         // lookahead distance (tune)
-    const double k_p   = 1.0 / Delta;  // gain  (matches kp = 1/delta)
+    return true;
+  }
 
-    // 1) Path heading from waypoint motion: chi_p = atan2(dY, dX)
-    double vxy = std::hypot(v_[WX], v_[WY]);
-    PI_p_ = std::atan2(v_[WY], v_[WX]);
-    PI_p_ = wrapToPi(PI_p_);
+  HeadingReference compute_heading_reference_(
+      const std::array<double, 6>& pose_world,
+      double dt) {
+    HeadingReference reference;
+    constexpr double kLookaheadDistance = 5.0;
+    const double lookahead_gain = 1.0 / kLookaheadDistance;
 
-    // 2) Cross-track error in path frame
-    // ex, ey: error in world frame
-    // double ex = P_world[X] - p_[WX];
-    // double ey = P_world[Y] - p_[WY];
+    reference.path_heading = wrapToPi(std::atan2(v_[WY], v_[WX]));
 
-    double ex = P_world[X] - p_ref_[WX];
-    double ey = P_world[Y] - p_ref_[WY];
+    const double ex = pose_world[X] - p_ref_[WX];
+    const double ey = pose_world[Y] - p_ref_[WY];
+    const double cos_path = std::cos(reference.path_heading);
+    const double sin_path = std::sin(reference.path_heading);
+    reference.cross_track_error = -sin_path * ex + cos_path * ey;
 
-    // Rotate into path frame (x_e along path, y_e lateral)
-    double cos = std::cos(PI_p_);
-    double sin = std::sin(PI_p_);
-    double x_e =  cos * ex + sin * ey;
-    double y_e = -sin * ex + cos * ey;   // lateral (cross-track) error
-    
-    // 3) Heading correction term X_p_ = -atan(kp * y_e)
-    double X_p_ ;
-    double psi_d_raw;  
-    X_p_ = -std::atan(k_p * y_e);
+    reference.heading_correction =
+      -std::atan(lookahead_gain * reference.cross_track_error);
+    reference.desired_yaw = (std::abs(reference.cross_track_error) > 5e-3)
+      ? wrapToPi(reference.path_heading + reference.heading_correction)
+      : reference.path_heading;
 
-    if (std::abs(y_e) > 5e-3) 
-        psi_d_raw = wrapToPi(PI_p_ + X_p_);
-    else
-    psi_d_raw = PI_p_;
+    reference.desired_roll = 0.0;
+    reference.desired_pitch = p_ref_[WPITCH];
 
+    if (previous_desired_yaw_valid_ && dt > 0.0) {
+      reference.desired_yaw_rate =
+        wrapToPi(reference.desired_yaw - previous_desired_yaw_) / dt;
+    }
+
+    previous_desired_yaw_ = reference.desired_yaw;
+    previous_desired_yaw_valid_ = true;
+
+    return reference;
+  }
+
+  void publish_reference_topics_(const WorldFrameState& world_state,
+                                const HeadingReference& reference) {
     if (pub_pi_p_) {
-    nav_msgs::msg::Odometry o;
-    o.header.stamp = s_copy.stamp;
-    o.header.frame_id = global_frame_;
-    o.child_frame_id = "pi_p";
+      nav_msgs::msg::Odometry msg;
+      msg.header.stamp = world_state.raw_state.stamp;
+      msg.header.frame_id = global_frame_;
+      msg.child_frame_id = "pi_p";
+      msg.pose.pose.position.x = p_ref_[WX];
+      msg.pose.pose.position.y = p_ref_[WY];
+      msg.pose.pose.position.z = p_ref_[WZ];
 
-    // put it at the waypoint position (or at the vehicle position, your choice)
-    // o.pose.pose.position.x = p_[WX];
-    // o.pose.pose.position.y = p_[WY];
-    // o.pose.pose.position.z = p_[WZ];
-
-    o.pose.pose.position.x = p_ref_[WX];
-    o.pose.pose.position.y = p_ref_[WY];
-    o.pose.pose.position.z = p_ref_[WZ];
-
-    tf2::Quaternion q;
-    q.setRPY(0.0, 0.0, psi_d_raw);
-    o.pose.pose.orientation = tf2::toMsg(q);
-
-    pub_pi_p_->publish(o);
+      tf2::Quaternion q_heading;
+      q_heading.setRPY(0.0, 0.0, reference.desired_yaw);
+      msg.pose.pose.orientation = tf2::toMsg(q_heading);
+      pub_pi_p_->publish(msg);
     }
 
-
-    // 4) Raw desired heading
-    double psi_d = psi_d_raw;
-    const double roll_d  = 0.0;
-    const double pitch_d = p_ref_[WPITCH];
-    const double yaw_d   = psi_d;
-
-    const double z1_roll  = wrapToPi(P_world[ROLL]  - roll_d);
-    const double z1_pitch = wrapToPi(P_world[PITCH] - pitch_d);
-    const double z1_yaw   = wrapToPi(P_world[YAW]   - yaw_d);
-
-    // Publish actual Euler angles
     if (pub_actual_rpy_) {
       geometry_msgs::msg::Vector3Stamped msg;
-      msg.header.stamp = s_copy.stamp;
+      msg.header.stamp = world_state.raw_state.stamp;
       msg.header.frame_id = global_frame_;
-      msg.vector.x = P_world[ROLL];
-      msg.vector.y = P_world[PITCH];
-      msg.vector.z = P_world[YAW];
+      msg.vector.x = world_state.pose[ROLL];
+      msg.vector.y = world_state.pose[PITCH];
+      msg.vector.z = world_state.pose[YAW];
       pub_actual_rpy_->publish(msg);
     }
 
-    // Publish desired Euler angles
     if (pub_desired_rpy_) {
       geometry_msgs::msg::Vector3Stamped msg;
-      msg.header.stamp = s_copy.stamp;
+      msg.header.stamp = world_state.raw_state.stamp;
       msg.header.frame_id = global_frame_;
-      msg.vector.x = roll_d;
-      msg.vector.y = pitch_d;
-      msg.vector.z = yaw_d;
+      msg.vector.x = reference.desired_roll;
+      msg.vector.y = reference.desired_pitch;
+      msg.vector.z = reference.desired_yaw;
       pub_desired_rpy_->publish(msg);
     }
+  }
 
-    // Publish Euler-angle errors
+  void publish_world_topics_(const WorldFrameState& world_state,
+                            const HeadingReference& reference) {
+    if (pub_world_odom_) {
+      nav_msgs::msg::Odometry world_msg;
+      world_msg.header.stamp = world_state.raw_state.stamp;
+      world_msg.header.frame_id = global_frame_;
+      world_msg.child_frame_id = base_frame_;
+      world_msg.pose.pose.position.x = world_state.pose[X];
+      world_msg.pose.pose.position.y = world_state.pose[Y];
+      world_msg.pose.pose.position.z = world_state.pose[Z];
+
+      tf2::Quaternion q_world;
+      q_world.setRPY(
+        world_state.pose[ROLL],
+        world_state.pose[PITCH],
+        world_state.pose[YAW]);
+      world_msg.pose.pose.orientation = tf2::toMsg(q_world);
+
+      world_msg.twist.twist.linear.x = world_state.twist[X];
+      world_msg.twist.twist.linear.y = world_state.twist[Y];
+      world_msg.twist.twist.linear.z = world_state.twist[Z];
+      world_msg.twist.twist.angular.x = world_state.twist[ROLL];
+      world_msg.twist.twist.angular.y = world_state.twist[PITCH];
+      world_msg.twist.twist.angular.z = world_state.twist[YAW];
+      pub_world_odom_->publish(world_msg);
+    }
+
+    if (pub_wp_odom_) {
+      nav_msgs::msg::Odometry waypoint_msg;
+      waypoint_msg.header.stamp = world_state.raw_state.stamp;
+      waypoint_msg.header.frame_id = global_frame_;
+      waypoint_msg.child_frame_id = "waypoint";
+      waypoint_msg.pose.pose.position.x = p_ref_[WX];
+      waypoint_msg.pose.pose.position.y = p_ref_[WY];
+      waypoint_msg.pose.pose.position.z = p_ref_[WZ];
+
+      tf2::Quaternion q_waypoint;
+      q_waypoint.setRPY(0.0, p_ref_[WPITCH], reference.desired_yaw);
+      waypoint_msg.pose.pose.orientation = tf2::toMsg(q_waypoint);
+
+      waypoint_msg.twist.twist.linear.x = v_ref_local_[WX];
+      waypoint_msg.twist.twist.linear.y = v_ref_local_[WY];
+      waypoint_msg.twist.twist.linear.z = v_ref_local_[WZ];
+      waypoint_msg.twist.twist.angular.x = 0.0;
+      waypoint_msg.twist.twist.angular.y = v_ref_local_[WPITCH];
+      waypoint_msg.twist.twist.angular.z = reference.desired_yaw_rate;
+      pub_wp_odom_->publish(waypoint_msg);
+    }
+  }
+
+  void publish_tracking_error_topics_(
+      const WorldFrameState& world_state,
+      const HeadingReference& reference,
+      double z1_roll,
+      double z1_pitch,
+      double z1_yaw,
+      const std::array<double, 4>& reference_velocity) {
     if (pub_z1_ang_) {
       geometry_msgs::msg::Vector3Stamped msg;
-      msg.header.stamp = s_copy.stamp;
+      msg.header.stamp = world_state.raw_state.stamp;
       msg.header.frame_id = global_frame_;
       msg.vector.x = z1_roll;
       msg.vector.y = z1_pitch;
@@ -841,496 +1361,467 @@ private:
       pub_z1_ang_->publish(msg);
     }
 
-    // // --- Smooth desired yaw (wrap-safe low-pass) ---
-    // static bool psi_init = false;
-    // static double psi_d_filt = 0.0;   // filtered desired yaw
-
-    // const double tau_psi = 1.0;       // seconds (tune: bigger = smoother)
-    // double alpha_psi = dt / (tau_psi + dt);
-    // if (alpha_psi < 0.0) alpha_psi = 0.0;
-    // if (alpha_psi > 1.0) alpha_psi = 1.0;
-
-    // if (!psi_init) {
-    //   psi_d_filt = psi_d_raw;         // initialize once
-    //   psi_init = true;
-    // } else {
-    //   // filter the shortest angular difference
-    //   double e = wrapToPi(psi_d_raw - psi_d_filt);
-    //   psi_d_filt = wrapToPi(psi_d_filt + alpha_psi * e);
-    // }
-
-    // // filtered desired yaw
-    // double psi_d = psi_d_raw; //psi_d_filt;
-
-    // filtered desired yaw rate
-    static double    psi_d_prev_filt = psi_d;
-    double psi_dot_d = wrapToPi(psi_d - psi_d_prev_filt) / dt;
-    psi_d_prev_filt  = psi_d;
-
-    // Publish world odometry
-    if (pub_world_odom_) {
-      nav_msgs::msg::Odometry world_msg;
-      world_msg.header.stamp    = s_copy.stamp;       // same as odom
-      world_msg.header.frame_id = global_frame_;      // e.g. "mauv_1/world"
-      world_msg.child_frame_id  = base_frame_;        // e.g. "mauv_1/base_link"
-
-      world_msg.pose.pose.position.x = P_world[X];
-      world_msg.pose.pose.position.y = P_world[Y];
-      world_msg.pose.pose.position.z = P_world[Z];
-
-      tf2::Quaternion q_rpy;
-      q_rpy.setRPY(P_world[ROLL], P_world[PITCH], P_world[YAW]);
-      world_msg.pose.pose.orientation = tf2::toMsg(q_rpy);
-
-      world_msg.twist.twist.linear.x  = V_world[X];
-      world_msg.twist.twist.linear.y  = V_world[Y];
-      world_msg.twist.twist.linear.z  = V_world[Z];
-      world_msg.twist.twist.angular.x = V_world[ROLL];
-      world_msg.twist.twist.angular.y = V_world[PITCH];
-      world_msg.twist.twist.angular.z = V_world[YAW];
-
-      pub_world_odom_->publish(world_msg);
-    }
-
-    // Publish waypoint (leader) in world frame
-    if (pub_wp_odom_) {
-      nav_msgs::msg::Odometry wp_msg;
-      wp_msg.header.stamp    = s_copy.stamp;
-      wp_msg.header.frame_id = global_frame_;  // same as P_world
-      wp_msg.child_frame_id  = "waypoint";
-
-      // waypoint position [X, Y, Z, Pitch]
-      // wp_msg.pose.pose.position.x = p_[WX];
-      // wp_msg.pose.pose.position.y = p_[WY];
-      // wp_msg.pose.pose.position.z = p_[WZ];
-
-      wp_msg.pose.pose.position.x = p_ref_[WX];
-      wp_msg.pose.pose.position.y = p_ref_[WY];
-      wp_msg.pose.pose.position.z = p_ref_[WZ];
-
-      // Waypoint orientation:
-      // roll_ref = 0
-      // pitch_ref = p_[WPITCH]
-      // yaw_ref   = psi_d  (desired yaw from LOS)
-      tf2::Quaternion q_wp;
-      // q_wp.setRPY(0.0, p_[WPITCH], psi_d); 
-      q_wp.setRPY(0.0, p_ref_[WPITCH], psi_d);
-
-      wp_msg.pose.pose.orientation = tf2::toMsg(q_wp);
-
-      // waypoint velocities
-      // wp_msg.twist.twist.linear.x  = v_[WX];
-      // wp_msg.twist.twist.linear.y  = v_[WY];
-      // wp_msg.twist.twist.linear.z  = v_[WZ];
-      // wp_msg.twist.twist.angular.y = v_[WPITCH];
-      // wp_msg.twist.twist.angular.z = psi_dot_d;
-
-      wp_msg.twist.twist.linear.x  = v_ref_local_[WX];
-      wp_msg.twist.twist.linear.y  = v_ref_local_[WY];
-      wp_msg.twist.twist.linear.z  = v_ref_local_[WZ];
-      wp_msg.twist.twist.angular.x = 0.0;
-      wp_msg.twist.twist.angular.y = v_ref_local_[WPITCH];
-      wp_msg.twist.twist.angular.z = psi_dot_d;
-
-      pub_wp_odom_->publish(wp_msg);
-    }
-
-    // Control errors in World
-    // z1_[WX]     = P_world[X] - p_[WX];                   // ex
-    // z1_[WYAW]   = P_world[Y] - p_[WY]; // wrapToPi(P_world[YAW] - psi_d);        // e_yaw
-    // z1_[WZ]     = P_world[Z] - p_[WZ];                   // ez
-    // z1_[WPITCH] = wrapToPi(P_world[PITCH] - p_[WPITCH]); // e_pitch
-
-    z1_[WX]     = P_world[X] - p_ref_[WX];
-    z1_[WY]     = P_world[Y] - p_ref_[WY];
-    z1_[WZ]     = P_world[Z] - p_ref_[WZ];
-    z1_[WPITCH] = wrapToPi(P_world[PITCH] - p_ref_[WPITCH]);
-
-
-
-    // ************************************************************
-    // z1 = [ex, e_yaw, ez, e_pitch]
-    // ex      = x - x_ref
-    // e_yaw   = yaw - psi_d          (psi_d: desired yaw from LOS)
-    // ez      = z - z_ref
-    // e_pitch = pitch - pitch_ref
-    // ************************************************************
-
-    double H1z1[4]{};
-    mat4_mul_vec(H1_, z1_.data(), H1z1);
-
-    // v_ref = [ẋ_ref, ψ̇_ref, ż_ref, θ̇_ref]
-    // double v_ref[4] = { v_[WX], psi_dot_d, v_[WZ], v_[WPITCH]};
-    // double v_ref[4] = {v_[WX], v_[WY], v_[WZ], v_[WPITCH]};
-
-    double v_ref[4] = {
-      v_ref_local_[WX],
-      v_ref_local_[WY],
-      v_ref_local_[WZ],
-      v_ref_local_[WPITCH]
-    };
-
-    for (int i=0; i<4; ++i) {
-      beta_[i] = -H1z1[i] + v_ref[i];
-    }
-
-    // z2 = [eẋ, e_ψ̇, eż, e_θ̇]
-    z2_[WX]     = V_world[X]     - beta_[WX];     // eẋ
-    z2_[WYAW]   = V_world[Y]     - beta_[WY];     // e_ψ̇ (yaw rate error)
-    z2_[WZ]     = V_world[Z]     - beta_[WZ];     // eż
-    z2_[WPITCH] = V_world[PITCH] - beta_[WPITCH]; // e_θ̇ (pitch rate error)
-
-    // double z1_roll  = P_world[ROLL];
-    // double z1_pitch = P_world[PITCH];
-    // double z1_yaw   = wrapToPi(P_world[YAW]   - psi_d);
-
-    if (pub_z1_ang_) {
-      geometry_msgs::msg::Vector3Stamped msg;
-      msg.header.stamp = s_copy.stamp;
-      msg.header.frame_id = global_frame_;
-
-      msg.vector.x = z1_roll;   // roll error
-      msg.vector.y = z1_pitch;  // pitch error
-      msg.vector.z = z1_yaw;    // yaw error
-
-      pub_z1_ang_->publish(msg);
-    }
-    
-    // Publish z1 (position error) with z2 as its velocity error
     if (pub_z1_odom_) {
       nav_msgs::msg::Odometry z1_msg;
-      z1_msg.header.stamp    = s_copy.stamp;
-      z1_msg.header.frame_id = global_frame_;   // same frame as P_world
-      z1_msg.child_frame_id  = "z1";
+      z1_msg.header.stamp = world_state.raw_state.stamp;
+      z1_msg.header.frame_id = global_frame_;
+      z1_msg.child_frame_id = "z1";
+      z1_msg.pose.pose.position.x = z1_[WX];
+      z1_msg.pose.pose.position.y = z1_[WY];
+      z1_msg.pose.pose.position.z = z1_[WZ];
 
-      // Position error
-      z1_msg.pose.pose.position.x = z1_[WX];    // ex
-      z1_msg.pose.pose.position.y = z1_[WY];    //P_world[Y] - p_[WY]; // unused in control, but used in error visualization
-      z1_msg.pose.pose.position.z = z1_[WZ];    // ez
+      tf2::Quaternion q_error;
+      q_error.setRPY(z1_roll, z1_pitch, z1_yaw);
+      z1_msg.pose.pose.orientation = tf2::toMsg(q_error);
 
-      // Orientation encodes BOTH pitch and yaw errors (roll = 0)
-      // RPY(z1): [0, e_pitch, e_yaw]
-
-      tf2::Quaternion q_z1;
-      // q_z1.setRPY(P_world[ROLL],         // roll error 
-      //             z1_[WPITCH],    // pitch error
-      //             P_world[YAW]   - psi_d);       // yaw error
-      q_z1.setRPY(z1_roll, z1_pitch, z1_yaw);
-      z1_msg.pose.pose.orientation = tf2::toMsg(q_z1);
-
-      // Velocity error = z2
-      z1_msg.twist.twist.linear.x  = V_world[X]     - v_ref[WX]; //z2_[WX];      // evx
-      z1_msg.twist.twist.linear.y  = V_world[Y]     - v_ref[WY]; //z2_[WY];      // unused, 
-      z1_msg.twist.twist.linear.z  = V_world[Z]     - v_ref[WZ]; //z2_[WZ];      // evz
-
-      z1_msg.twist.twist.angular.x = V_world[ROLL];
-      z1_msg.twist.twist.angular.y = V_world[PITCH] - v_ref[WPITCH];  // eω_pitch
-      z1_msg.twist.twist.angular.z = V_world[YAW] - psi_dot_d;    // eω_yaw
+      z1_msg.twist.twist.linear.x = world_state.twist[X] - reference_velocity[WX];
+      z1_msg.twist.twist.linear.y = world_state.twist[Y] - reference_velocity[WY];
+      z1_msg.twist.twist.linear.z = world_state.twist[Z] - reference_velocity[WZ];
+      z1_msg.twist.twist.angular.x = world_state.twist[ROLL];
+      z1_msg.twist.twist.angular.y =
+        world_state.twist[PITCH] - reference_velocity[WPITCH];
+      z1_msg.twist.twist.angular.z =
+        world_state.twist[YAW] - reference.desired_yaw_rate;
       pub_z1_odom_->publish(z1_msg);
     }
+  }
 
-    // Pack world state (for RBF)
-    std::array<double,12> X_world = {
-      P_world[0], P_world[1], P_world[2],
-      P_world[3], P_world[4], P_world[5],
-      V_world[0], V_world[1], V_world[2],
-      V_world[3], V_world[4], V_world[5]
-    };
+  std::array<float, 8> build_rbf_input_(
+      const std::array<double, 12>& world_state_vector) const {
+    std::array<float, 8> rbf_input{};
+    rbf_input[0] = static_cast<float>(world_state_vector[X] / 100.0);
+    rbf_input[1] = static_cast<float>(world_state_vector[Y] / 50.0);
+    rbf_input[2] = static_cast<float>(world_state_vector[Z] / 10.0);
+    rbf_input[3] = static_cast<float>(world_state_vector[PITCH] * 5.0);
+    rbf_input[4] = static_cast<float>(world_state_vector[X + 6]);
+    rbf_input[5] = static_cast<float>(world_state_vector[Y + 6]);
+    rbf_input[6] = static_cast<float>(world_state_vector[Z + 6] * 2.0);
+    rbf_input[7] = static_cast<float>(world_state_vector[PITCH + 6] * 10.0);
+    return rbf_input;
+  }
 
-    float x_f[8];
-    x_f[0] = static_cast<float>(X_world[X] / 100.0);         // scale_pos_
-    x_f[1] = static_cast<float>(X_world[Y] / 50.0);          // scale_ang_
-    x_f[2] = static_cast<float>(X_world[Z]/10.0);            // scale_pos_
-    x_f[3] = static_cast<float>(X_world[PITCH] * 5.0);       // scale_ang_
-    x_f[4] = static_cast<float>(X_world[X + 6]);             // scale_lin_
-    x_f[5] = static_cast<float>(X_world[Y + 6]);             // scale_angvel_
-    x_f[6] = static_cast<float>(X_world[Z + 6] *2);          // scale_lin_
-    x_f[7] = static_cast<float>(X_world[PITCH + 6] *10.0);   // scale_angvel_
+  void publish_weight_norms_() {
+    if (!(rbf_ && rbf_->ready() && pub_w_norms_)) {
+      return;
+    }
 
-    // RBF evaluation and weight update
-    if (rbf_ && rbf_->ready()) {
+    if (++weight_norm_publish_counter_ % 10 != 0) {
+      return;
+    }
 
-      // 1) compute S(x) on GPU
-      rbf_->compute_S(x_f);
-      
-      // // Optional debug of S(x)
-      // {
-      //   static int dbg_counter = 0;
-      //   if (dbg_counter++ % 50 == 0) {   // print every 50 cycles
-      //     const std::uint64_t N = rbf_->num_points();
-      //     std::vector<float> S(N);
-      //     rbf_->copy_S_to_host(S.data());
+    const uint64_t point_count = rbf_->num_points();
+    std::vector<float> weights(4 * point_count);
+    if (rbf_->download_W(weights.data()) != cudaSuccess) {
+      return;
+    }
 
-      //     double minS = 1e300, maxS = -1e300;
-      //     std::uint64_t idx_max = 0;
-
-      //     for (std::uint64_t i = 0; i < N; ++i) {
-      //       const double v = (double)S[i];
-      //       if (v < minS) minS = v;
-      //       if (v > maxS) { maxS = v; idx_max = i; }
-      //     }
-
-      //     float c[8];
-      //     if (rbf_->download_center(idx_max, c) == cudaSuccess) {
-      //       // RCLCPP_INFO(get_logger(),
-      //       //   "S: min=%.3e max=%.3e idx_max=%llu center=[%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f]",
-      //       //   minS, maxS, (unsigned long long)idx_max,
-      //       //   c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
-      //     }
-      //   }
-      // }
-
-      // 2) F = [w1^T S, ..., w4^T S]
-      float Ff[4];
-      rbf_->dot_F(Ff);
+    double sum_sq[4] = {0.0, 0.0, 0.0, 0.0};
+    for (uint64_t j = 0; j < point_count; ++j) {
       for (int i = 0; i < 4; ++i) {
-        F_[i] = static_cast<double>(Ff[i]);
-      } 
-
-      // 3) update weights using z2[i]
-      float z2f[4];
-      for (int i=0; i<4;++i) {
-        z2f[i] = static_cast<float>(z2_[i]);
-      }
-
-      static const float gamma1 = 2.2e-4f;   //  0.0;
-      static const float sigma  = 5.0e-1f;   //  0.0;
-
-      rbf_->update_w(z2f, gamma1, sigma);
-
-      // Publish L2 norms every 10th loop
-      static int norm_counter = 0;
-      if (pub_w_norms_ && (++norm_counter % 10 == 0)) {  // ~1 Hz if loop is 10 Hz
-        const uint64_t N = rbf_->num_points();
-        std::vector<float> W(4 * N);
-
-        if (rbf_->download_W(W.data()) == cudaSuccess) {
-          double sum_sq[4] = {0.0, 0.0, 0.0, 0.0};
-
-          for (uint64_t j = 0; j < N; ++j) {
-            for (int i = 0; i < 4; ++i) {
-              float wij = W[i * N + j];   // row-major blocks: [w0(0..N-1), w1(..), ...]
-              sum_sq[i] += static_cast<double>(wij) * static_cast<double>(wij);
-            }
-          }
-
-          std_msgs::msg::Float32MultiArray msg;
-          msg.layout.dim.resize(1);
-          msg.layout.dim[0].label  = "norms";
-          msg.layout.dim[0].size   = 4;
-          msg.layout.dim[0].stride = 4;
-
-          msg.data.resize(4);
-          for (int i = 0; i < 4; ++i) {
-            msg.data[i] = static_cast<float>(std::sqrt(sum_sq[i])); // ||wi||
-          }
-
-          pub_w_norms_->publish(msg);
-        }
+        const float weight = weights[i * point_count + j];
+        sum_sq[i] += static_cast<double>(weight) * static_cast<double>(weight);
       }
     }
 
-    // // OPTIONAL: publish full weight matrix W (4×N) at low rate
-    // static size_t w_tick = 0;
-    // if (rbf_ && rbf_->ready() && pub_W_ && (w_tick++ % 50 == 0)){   // publish every 50 cycles (adjust as you like)
-    //   std::vector<float> W_host;
-    //   rbf_->copy_W_to_host(W_host);         // size = 4 * N
+    std_msgs::msg::Float32MultiArray msg;
+    msg.layout.dim.resize(1);
+    msg.layout.dim[0].label = "norms";
+    msg.layout.dim[0].size = 4;
+    msg.layout.dim[0].stride = 4;
+    msg.data.resize(4);
 
-    //   std_msgs::msg::Float32MultiArray msg;
-    //   msg.layout.dim.resize(2);
+    for (int i = 0; i < 4; ++i) {
+      msg.data[i] = static_cast<float>(std::sqrt(sum_sq[i]));
+    }
 
-    //   // dim[0] = output index (0..3)
-    //   msg.layout.dim[0].label  = "output";
-    //   msg.layout.dim[0].size   = 4;
-    //   msg.layout.dim[0].stride = 4 * static_cast<uint32_t>(rbf_->num_points());
+    pub_w_norms_->publish(msg);
+  }
 
-    //   // dim[1] = RBF index (0..N-1)
-    //   msg.layout.dim[1].label  = "rbf";
-    //   msg.layout.dim[1].size   = static_cast<uint32_t>(rbf_->num_points());
-    //   msg.layout.dim[1].stride = static_cast<uint32_t>(rbf_->num_points());
+  void publish_weights_for_neighbors_() {
+    if (!(rbf_ && rbf_->ready() && pub_W_)) {
+      return;
+    }
 
-    //   msg.data = std::move(W_host);   // flatten: length = 4 * N
+    if (weight_publish_tick_++ % 10 != 0) {
+      return;
+    }
 
-    //   pub_W_->publish(msg);
+    std::vector<float> weights_host;
+    rbf_->copy_W_to_host(weights_host);
+
+    std_msgs::msg::Float32MultiArray msg;
+    msg.layout.dim.resize(2);
+    msg.layout.dim[0].label = "output";
+    msg.layout.dim[0].size = 4;
+    msg.layout.dim[0].stride =
+      4 * static_cast<uint32_t>(rbf_->num_points());
+    msg.layout.dim[1].label = "rbf";
+    msg.layout.dim[1].size = static_cast<uint32_t>(rbf_->num_points());
+    msg.layout.dim[1].stride =
+      static_cast<uint32_t>(rbf_->num_points());
+    msg.data = std::move(weights_host);
+    pub_W_->publish(msg);
+  }
+
+  void update_rbf_controller_(const std::array<float, 8>& rbf_input) {
+    if (!(rbf_ && rbf_->ready())) {
+      return;
+    }
+
+    rbf_->compute_S(rbf_input.data());
+
+    // Debug helper: inspect S(x) and the most active center when needed.
+    // {
+    //   static int dbg_counter = 0;
+    //   if (dbg_counter++ % 50 == 0) {
+    //     const std::uint64_t N = rbf_->num_points();
+    //     std::vector<float> S(N);
+    //     rbf_->copy_S_to_host(S.data());
+    //
+    //     double minS = 1e300;
+    //     double maxS = -1e300;
+    //     std::uint64_t idx_max = 0;
+    //
+    //     for (std::uint64_t i = 0; i < N; ++i) {
+    //       const double value = static_cast<double>(S[i]);
+    //       if (value < minS) minS = value;
+    //       if (value > maxS) {
+    //         maxS = value;
+    //         idx_max = i;
+    //       }
+    //     }
+    //
+    //     float center[8];
+    //     if (rbf_->download_center(idx_max, center) == cudaSuccess) {
+    //       // RCLCPP_INFO(get_logger(),
+    //       //   "S: min=%.3e max=%.3e idx_max=%llu center=[%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f]",
+    //       //   minS, maxS, (unsigned long long)idx_max,
+    //       //   center[0], center[1], center[2], center[3],
+    //       //   center[4], center[5], center[6], center[7]);
+    //     }
+    //   }
     // }
 
-    // tau = F - H2*z2 - z1, in world frame
+    std::array<float, 4> learned_output_host{};
+    rbf_->dot_F(learned_output_host.data());
+    for (int i = 0; i < 4; ++i) {
+      F_[i] = static_cast<double>(learned_output_host[i]);
+    }
+
+    std::array<float, 4> z2_host{};
+    for (int i = 0; i < 4; ++i) {
+      z2_host[i] = static_cast<float>(z2_[i]);
+    }
+
+    static const float gamma1 = 2.2e-4f;
+    static const float gamma2 = 1.0e-4f;
+    static const float sigma = 5.0e-1f;
+
+    const uint64_t point_count = rbf_->num_points();
+    const size_t expected_weight_count =
+      static_cast<size_t>(4) * static_cast<size_t>(point_count);
+    std::vector<float> neighbor_sum(expected_weight_count, 0.0f);
+    int valid_neighbors = 0;
+
+    {
+      std::lock_guard<std::mutex> lk(neighbor_weights_mutex_);
+      for (const auto& neighbor_name : neighbor_names_) {
+        const auto it = neighbor_weights_.find(neighbor_name);
+        if (it == neighbor_weights_.end()) {
+          continue;
+        }
+
+        const auto& neighbor_weights = it->second;
+        if (neighbor_weights.size() != expected_weight_count) {
+          continue;
+        }
+
+        for (size_t idx = 0; idx < expected_weight_count; ++idx) {
+          neighbor_sum[idx] += neighbor_weights[idx];
+        }
+        ++valid_neighbors;
+      }
+    }
+
+    if (learning_phase_ != LearningPhase::Frozen) {
+      if (valid_neighbors > 0) {
+        const cudaError_t coop_err = rbf_->update_w_cooperative(
+          z2_host.data(),
+          neighbor_sum.data(),
+          static_cast<float>(valid_neighbors),
+          gamma1,
+          gamma2,
+          sigma);
+
+        if (coop_err != cudaSuccess) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Cooperative weight update failed (%s). Falling back to local update.",
+            cudaGetErrorString(coop_err));
+          rbf_->update_w(z2_host.data(), gamma1, sigma);
+        } else {
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 20000,
+            "Cooperative update active with %d neighbor(s).",
+            valid_neighbors);
+        }
+      } else {
+        rbf_->update_w(z2_host.data(), gamma1, sigma);
+      }
+    } else {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 20000,
+        "Frozen learning active: reusing averaged RBF weights.");
+    }
+
+    if (learning_phase_ == LearningPhase::SteadyRecording) {
+      record_steady_weight_sample_();
+    }
+
+    publish_weight_norms_();
+  }
+
+  void compute_control_effort_(const WorldFrameState& world_state) {
     double H2z2[4]{};
     mat4_mul_vec(H2_, z2_.data(), H2z2);
     for (int i = 0; i < 4; ++i) {
-      tau_[i] = F_[i] - H2z2[i] - z1_[i];   
+      tau_[i] = F_[i] - H2z2[i] - z1_[i];
     }
 
-    // double Ft = tau_[WX];   // force along path tangent
-    // double Fx_w =  c * Ft;
-    // double Fy_w =  s * Ft;
-    
-    // Map tau to body frame: world → base_link
-    tf2::Matrix3x3 R_bw = R_wb.transpose();
+    const tf2::Matrix3x3 rotation_body_from_world =
+      world_state.rotation_world_from_body.transpose();
+    const tf2::Vector3 force_world(tau_[WX], tau_[WY], tau_[WZ]);
+    const tf2::Vector3 force_body = rotation_body_from_world * force_world;
+    const Eigen::Vector3d moment_world(0.0, tau_[WPITCH], 0.0);
+    const Eigen::Vector3d moment_body =
+      world_state.euler_rate_transform.inverse() * moment_world;
 
-    // τ in world frame:
-    // tau_[WX]    -> Fx (surge)
-    // tau_[WZ]    -> Fz (heave)
-    // tau_[WY]    -> Fy (yaw moment)
-    // tau_[WPITCH]-> My (pitch moment)
-    tf2::Vector3 F_world(tau_[WX], tau_[WY], tau_[WZ]);
-    // tf2::Vector3 F_world(tau_[WX],    0.0,    tau_[WZ]);
-    tf2::Vector3 M_world(0.0, tau_[WPITCH], 0.0);   // tau_[WYAW]
+    tau_body_[WX] = force_body.x();
+    tau_body_[WY] = force_body.y();
+    tau_body_[WZ] = force_body.z();
+    tau_body_[WPITCH] = moment_body.y();
+  }
 
-    tf2::Vector3 F_body = R_bw * F_world;
-    // tf2::Vector3 M_body = R_bw * M_world;
-    Eigen::Vector3d M_WOLRD(0.0, tau_[WPITCH], 0.0);
-    Eigen::Vector3d M_body = T.inverse() * M_WOLRD;
+  bool ensure_allocation_ready_() {
+    if (alloc_ready_) {
+      return true;
+    }
 
-    tau_body_[WX]     = F_body.x();   // body Fx
-    tau_body_[WY]     = F_body.y();   // body Fy
-    tau_body_[WZ]     = F_body.z();   // body Fz
-    tau_body_[WPITCH] = M_body.y();   // body My (pitch)
-
-    // Thruster allocation
-    if (!alloc_ready_) {
     try {
       (void)compute_allocation_from_tf_();
     } catch (const tf2::TransformException& ex) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Alloc TF lookup failed: %s", ex.what());
-      return; // try again next cycle
-    }
-    if (!alloc_ready_) {
-      return; // safety
-    }
+      return false;
     }
 
-
-  // Solve for nominal thruster forces (no limits/nonlinearity yet)
-  double f_ls[4];
-  if (solve_thruster_forces_ls_(tau_body_.data(), f_ls)) {
-    for (int i = 0; i < 4; ++i) {
-      thr_force_[i] = f_ls[i];
-    }
-  } else {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "Allocation solve failed (BᵀB near singular).");
-    // fall back to zero force or keep previous:
-    for (int i = 0; i < 4; ++i) {
-      thr_force_[i] = 0.0;
-    }
+    return alloc_ready_;
   }
 
-  // Thrusters command (filtered)
-  for (int i = 0; i < 4; ++i) {
-    double u_raw = force_to_cmd_(thr_force_[i], i);
+  bool update_thruster_commands_() {
+    if (!ensure_allocation_ready_()) {
+      return false;
+    }
 
-    double a = alpha_;  // default smoothing
+    std::array<double, 4> thruster_solution{};
+    if (solve_thruster_forces_ls_(tau_body_.data(), thruster_solution.data())) {
+      for (int i = 0; i < 4; ++i) {
+        thr_force_[i] = thruster_solution[i];
+      }
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Allocation solve failed (BᵀB near singular).");
+      for (int i = 0; i < 4; ++i) {
+        thr_force_[i] = 0.0;
+      }
+    }
 
-    thr_cmd_[i] = u_raw;
+    for (int i = 0; i < 4; ++i) {
+      thr_cmd_[i] = force_to_cmd_(thr_force_[i], i);
+    }
 
-
-  //   if (i == SURGE_T) {
-  //     // desired waypoint Y in [-5, 5] -> forward only
-  //     // const bool forward_zone = (p_[WY] >= -.1 && p_[WY] <= 0.1);
-  //     const bool forward_zone = (v_[WX] >= -.02 && v_[WX] <= 0.02);
-
-  //     double u_target = u_raw;
-  //     if (forward_zone) {
-  //       u_target = std::max(0.16, u_raw);   // forward-only
-  //     }
-
-  //     a = alpha_surge_;
-  //     thr_cmd_filt_[i] = (1.0 - a) * thr_cmd_filt_[i] + a * u_target;
-
-  //     // final safety clamp
-  //     if (thr_cmd_filt_[i] < -1.0) thr_cmd_filt_[i] = -1.0;
-  //     if (thr_cmd_filt_[i] >  1.0) thr_cmd_filt_[i] =  1.0;
-
-  //     thr_cmd_[i] = thr_cmd_filt_[i];
-  //     continue;
-  //   }
-
-  //   if (i == HEAVE_BOW_T || i == HEAVE_STERN_T) {
-  //     a = alpha_heave_;  
-  //   }
-  //   else {
-  //     a = 2*alpha_sway_; 
-  //   }
-
-  //   thr_cmd_filt_[i] = (1.0 - a) * thr_cmd_filt_[i] + a * u_raw;
-  //   thr_cmd_[i]      = 0.6*(thr_cmd_filt_[i]);
-  
+    return true;
   }
 
-  // Debug logs (throttled) 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    // "X_d=[%.3f, %.3f, %.3f,%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", 
-    //  X_waypoint_[0],X_waypoint_[1], psi_d, X_waypoint_[2],X_waypoint_[3],
-    //  X_waypoint_[4],X_waypoint_[5], psi_dot_d, X_waypoint_[6],X_waypoint_[7]);
+  void log_controller_state_(const WorldFrameState& world_state,
+                            const HeadingReference& reference,
+                            const std::array<float, 8>& rbf_input) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "learning_phase=%s steady_samples=%zu knowledge_source=%s formation_profile=%s",
+      learning_phase_to_string_(learning_phase_),
+      steady_sample_count_,
+      knowledge_source_to_string_(knowledge_source_),
+      formation_profile_to_string_(formation_profile_));
 
-    "X_d=[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
-    p_ref_[WX], p_ref_[WY], psi_d, p_ref_[WZ], p_ref_[WPITCH],
-    v_ref_local_[WX], v_ref_local_[WY], psi_dot_d, v_ref_local_[WZ], v_ref_local_[WPITCH]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "X_d=[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+      p_ref_[WX], p_ref_[WY], reference.desired_yaw, p_ref_[WZ], p_ref_[WPITCH],
+      v_ref_local_[WX], v_ref_local_[WY], reference.desired_yaw_rate,
+      v_ref_local_[WZ], v_ref_local_[WPITCH]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "X_w=[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", 
-    P_world[0],P_world[1], P_world[5], P_world[2],P_world[4],
-    V_world[0],V_world[1], V_world[5], V_world[2],V_world[4]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "X_w=[%.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f, %.3f]",
+      world_state.pose[X], world_state.pose[Y], world_state.pose[YAW],
+      world_state.pose[Z], world_state.pose[PITCH],
+      world_state.twist[X], world_state.twist[Y], world_state.twist[YAW],
+      world_state.twist[Z], world_state.twist[PITCH]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "x_f: [%.1f %.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
-     x_f[0], x_f[1], x_f[2], x_f[3],
-     x_f[4], x_f[5], x_f[6], x_f[7]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "x_f=[%.1f %.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      rbf_input[0], rbf_input[1], rbf_input[2], rbf_input[3],
+      rbf_input[4], rbf_input[5], rbf_input[6], rbf_input[7]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "z1=[%.3e, %.3e, %.3e, %.3e]", 
-    z1_[0],z1_[1],z1_[2],z1_[3]); 
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "z1=[%.3e, %.3e, %.3e, %.3e]",
+      z1_[0], z1_[1], z1_[2], z1_[3]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "z2=[%.3f, %.3f, %.3f %.3f]", 
-    z2_[0],z2_[1],z2_[2],z2_[3]); 
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "z2=[%.3f, %.3f, %.3f, %.3f]",
+      z2_[0], z2_[1], z2_[2], z2_[3]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "beta=[%.3e, %.3e, %.3e, %.3e]", 
-    beta_[0],beta_[1],beta_[2],beta_[3]); 
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "beta=[%.3e, %.3e, %.3e, %.3e]",
+      beta_[0], beta_[1], beta_[2], beta_[3]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "F=[%.3e, %.3e, %.3e, %.3e]", 
-    F_[0],F_[1],F_[2],F_[3]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "F=[%.3e, %.3e, %.3e, %.3e]",
+      F_[0], F_[1], F_[2], F_[3]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "tau = [%.3f %.3f %.3f %.3f ]", 
-    tau_[0], tau_[1], tau_[2], tau_[3]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "tau=[%.3f %.3f %.3f %.3f]",
+      tau_[0], tau_[1], tau_[2], tau_[3]);
 
-  RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 20000,
-    "tau_body = [%.3f %.3f %.3f %.3f ]",
-    tau_body_[0], tau_body_[1], tau_body_[2], tau_body_[3]);
-  
-  RCLCPP_INFO_THROTTLE(
-    get_logger(), *get_clock(), 20000,
-    "thr_cmd = [%.2f %.2f %.2f %.2f]", 
-    thr_cmd_[0], thr_cmd_[1], thr_cmd_[2], thr_cmd_[3]);
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 20000,
+      "tau_body=[%.3f %.3f %.3f %.3f]",
+      tau_body_[0], tau_body_[1], tau_body_[2], tau_body_[3]);
 
-  // Publish thruster commands
-  if (pub_heave_bow_) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 20000,
+      "thr_cmd=[%.2f %.2f %.2f %.2f]",
+      thr_cmd_[0], thr_cmd_[1], thr_cmd_[2], thr_cmd_[3]);
+  }
+
+  void publish_thruster_commands_() {
+    if (!pub_heave_bow_) {
+      return;
+    }
+
     std_msgs::msg::Float64 msg;
-    msg.data = thr_cmd_[SURGE_T];       pub_surge_->publish(msg);
-    msg.data = thr_cmd_[HEAVE_BOW_T];   pub_heave_bow_->publish(msg);
-    msg.data = thr_cmd_[HEAVE_STERN_T]; pub_heave_stern_->publish(msg);
-    msg.data = thr_cmd_[SWAY_BOW_T];    pub_sway_bow_->publish(msg);
-    }
+    msg.data = thr_cmd_[SURGE_T];
+    pub_surge_->publish(msg);
+    msg.data = thr_cmd_[HEAVE_BOW_T];
+    pub_heave_bow_->publish(msg);
+    msg.data = thr_cmd_[HEAVE_STERN_T];
+    pub_heave_stern_->publish(msg);
+    msg.data = thr_cmd_[SWAY_BOW_T];
+    pub_sway_bow_->publish(msg);
   }
 
   // --------------------------------------------------------------------------
-  // Thruster force → command mapping: T = c |u| u, solve for u
+  // Control step
+  // --------------------------------------------------------------------------
+  void process_data() {
+    apply_pending_runtime_updates_();
+
+    const double dt = compute_step_dt_();
+    update_waypoint_reference_(dt);
+
+    if (!ensure_frames_ready_()) {
+      return;
+    }
+
+    const FullState raw_state = copy_latest_state_();
+    WorldFrameState world_state;
+    if (!build_world_state_(raw_state, world_state)) {
+      return;
+    }
+
+    const HeadingReference reference =
+      compute_heading_reference_(world_state.pose, dt);
+    publish_reference_topics_(world_state, reference);
+    publish_world_topics_(world_state, reference);
+
+    const double z1_roll =
+      wrapToPi(world_state.pose[ROLL] - reference.desired_roll);
+    const double z1_pitch =
+      wrapToPi(world_state.pose[PITCH] - reference.desired_pitch);
+    const double z1_yaw =
+      wrapToPi(world_state.pose[YAW] - reference.desired_yaw);
+
+    z1_[WX] = world_state.pose[X] - p_ref_[WX];
+    z1_[WY] = world_state.pose[Y] - p_ref_[WY];
+    z1_[WZ] = world_state.pose[Z] - p_ref_[WZ];
+    z1_[WPITCH] = wrapToPi(world_state.pose[PITCH] - p_ref_[WPITCH]);
+
+    double H1z1[4]{};
+    mat4_mul_vec(H1_, z1_.data(), H1z1);
+
+    const std::array<double, 4> reference_velocity = {
+      v_ref_local_[WX],
+      v_ref_local_[WY],
+      v_ref_local_[WZ],
+      v_ref_local_[WPITCH]
+    };
+
+    for (int i = 0; i < 4; ++i) {
+      beta_[i] = -H1z1[i] + reference_velocity[i];
+    }
+
+    z2_[WX] = world_state.twist[X] - beta_[WX];
+    z2_[WYAW] = world_state.twist[Y] - beta_[WY];
+    z2_[WZ] = world_state.twist[Z] - beta_[WZ];
+    z2_[WPITCH] = world_state.twist[PITCH] - beta_[WPITCH];
+
+    publish_tracking_error_topics_(
+      world_state,
+      reference,
+      z1_roll,
+      z1_pitch,
+      z1_yaw,
+      reference_velocity);
+
+    const std::array<double, 12> world_state_vector = {
+      world_state.pose[X],
+      world_state.pose[Y],
+      world_state.pose[Z],
+      world_state.pose[ROLL],
+      world_state.pose[PITCH],
+      world_state.pose[YAW],
+      world_state.twist[X],
+      world_state.twist[Y],
+      world_state.twist[Z],
+      world_state.twist[ROLL],
+      world_state.twist[PITCH],
+      world_state.twist[YAW]
+    };
+
+    const std::array<float, 8> rbf_input = build_rbf_input_(world_state_vector);
+    update_rbf_controller_(rbf_input);
+    publish_weights_for_neighbors_();
+
+    compute_control_effort_(world_state);
+    if (!update_thruster_commands_()) {
+      return;
+    }
+
+    log_controller_state_(world_state, reference, rbf_input);
+    publish_thruster_commands_();
+  }
+
+  // --------------------------------------------------------------------------
+  // Thruster command mapping
   // --------------------------------------------------------------------------
   inline double force_to_cmd_(double T, int thruster_id) const
   {
@@ -1340,9 +1831,6 @@ private:
       return 0.0;
     }
     double a = std::abs(T) / c;
-    if (a < 0.0) {
-      a = 0.0;
-    }
     double u = std::sqrt(a);
     if (u > 1.0) {
       u = 1.0;
@@ -1351,7 +1839,7 @@ private:
   }
 
   // --------------------------------------------------------------------------
-  // Math helpers (4x4 multiply + angle wrapping)
+  // Math utilities
   // --------------------------------------------------------------------------
   static inline void mat4_mul_vec(const std::array<double,16>& M,
                                   const double v[4], 
@@ -1366,7 +1854,7 @@ private:
     }
   }
 
-    static inline double wrapToPi(double a)
+  static inline double wrapToPi(double a)
   {
     while (a >  M_PI) a -= 2.0*M_PI;
     while (a < -M_PI) a += 2.0*M_PI;
@@ -1387,7 +1875,7 @@ private:
     return 30*s*s - 60*s*s*s + 30*s*s*s*s;
   }
 
-  // Z reference with dwell + smooth moves, and pitch coupled to vertical velocity
+  // Z reference with dwell + smooth moves.
   inline void z_pitch_ref(double t, double &z_ref, double &dz_ref,
                           double &pitch_ref, double &dpitch_ref) const
   {
@@ -1395,62 +1883,46 @@ private:
     const double z_max = z_mid + z_amp;   // -> -1
     const double dz = (z_max - z_min);
 
-    const double pitch_max = pitch_amp;   // pitch limit
-
 
     const double T_hold = 200.0;   // seconds at top/bottom (tune)
-    const double T_move = 400.0;  // seconds to move between (tune: bigger => smaller vz)
+    const double T_move = 400.0;   // seconds to move between (tune: bigger => smaller vz)
 
     const double Tcycle = 2*T_hold + 2*T_move;
-    double tau = std::fmod(t, Tcycle);
-    if (tau < 0.0) tau += Tcycle;
+    double cycle_time = std::fmod(t, Tcycle);
+    if (cycle_time < 0.0) cycle_time += Tcycle;
 
-    // defaults
     z_ref      = z_min; 
     dz_ref     = 0.0;
     pitch_ref  = 0.0; 
     dpitch_ref = 0.0;
 
     auto move = [&](double s01, bool up) {
-      // s in [0,1]
       double p  = smooth5(s01);
       double dp = smooth5_d1(s01);
 
-      // position
       z_ref = up ? (z_min + dz*p) : (z_max - dz*p);
 
-      // dz/dt
       const double sign = up ? +1.0 : -1.0;
       dz_ref = sign * dz * (dp / T_move);
     };
 
-    if (tau < T_hold) {
-      // hold bottom
+    if (cycle_time < T_hold) {
       z_ref = z_min;
-    } else if (tau < T_hold + T_move) {
-      // move up
-      move((tau - T_hold)/T_move, true);
-    } else if (tau < T_hold + T_move + T_hold) {
-      // hold top
+    } else if (cycle_time < T_hold + T_move) {
+      move((cycle_time - T_hold)/T_move, true);
+    } else if (cycle_time < T_hold + T_move + T_hold) {
       z_ref = z_max;
     } else {
-      // move down
-      move((tau - (T_hold + T_move + T_hold))/T_move, false);
+      move((cycle_time - (T_hold + T_move + T_hold))/T_move, false);
     }
 
-    // Pitch follows vertical velocity; => pitch=0 at holds + turning points
-    // normalize so max |pitch| <= pitch_max
-    // (smooth5_d1 peak is 1.875 at s=0.5)
-    const double dz_peak = std::max(1e-9, std::abs(dz) * (1.875 / T_move));
-    // pitch_ref = clamp(pitch_max * (dz_ref / dz_peak), -pitch_max, +pitch_max);
+    // Pitch tracking is currently disabled.
     pitch_ref = 0.0;
-
-    // dpitch_ref (optional; set 0 if you don’t need it)
     dpitch_ref = 0.0;
   }
 
   // --------------------------------------------------------------------------
-  // Allocation matrix B from TF
+  // Thruster allocation matrix from TF
   // --------------------------------------------------------------------------
   bool compute_allocation_from_tf_() 
   {
@@ -1498,25 +1970,11 @@ private:
 
     alloc_ready_ = true;
 
-    // (Optional) print B
-    // RCLCPP_INFO(get_logger(),
-    //   "Allocation B = [\n"
-    //   " %.3f %.3f %.3f %.3f;\n"
-    //   " %.3f %.3f %.3f %.3f;\n"
-    //   " %.3f %.3f %.3f %.3f;\n"
-    //   " %.3f %.3f %.3f %.3f;\n"
-    //   " %.3f %.3f %.3f %.3f]", 
-    //   B_[X][0],     B_[X][1],     B_[X][2],     B_[X][3],
-    //   B_[Y][0],     B_[Y][1],     B_[Y][2],     B_[Y][3],
-    //   B_[Z][0],     B_[Z][1],     B_[Z][2],     B_[Z][3],
-    //   B_[PITCH][0], B_[PITCH][1], B_[PITCH][2], B_[PITCH][3],
-    //   B_[YAW][0], B_[YAW][1], B_[YAW][2], B_[YAW][3]);
-
     return true;
   }
 
   // --------------------------------------------------------------------------
-  // Waypoint generator dynamics xdot = f(t, x)
+  // Waypoint generator dynamics
   // --------------------------------------------------------------------------
   void compute_xdot(double t, 
                     const std::array<double,8>& x,
@@ -1533,7 +1991,6 @@ private:
     mat4_mul_vec(A0_,  qd, A0_qd);
     mat4_mul_vec(B0_,  q,  B0_q);
 
-    // double u[4] = {0.0, 0.0, kp_z * z_ref, 0.0}; 
     double zref, dzref, thref, dthref;
     z_pitch_ref(t, zref, dzref, thref, dthref);
 
@@ -1545,7 +2002,6 @@ private:
     // Track pitch_ref(t)
     u[WPITCH] = w_pitch * thref;
 
-
     for (int i=0;i<4;++i) {
       xdot[i]     = dq[i];                     // dq
       xdot[4 + i] = A0_qd[i] + B0_q[i] + u[i]; // dqdot
@@ -1553,7 +2009,7 @@ private:
   }
 
   // --------------------------------------------------------------------------
-  // RK4 integration step
+  // Waypoint integrator
   // --------------------------------------------------------------------------
   void rk4_step(double t, double dt, std::array<double,8>& x) 
   {
@@ -1581,166 +2037,167 @@ private:
     }
   }
 
-
-
   // --------------------------------------------------------------------------
-  // Member variables
+  // Persistent node state
   // --------------------------------------------------------------------------
 
-  // Simulation & timing 
-  double   sim_time_{0.0};
+  // Lifecycle and timing
+  double sim_time_{0.0};
   rclcpp::Time last_step_;
+  std::thread processing_thread_;
 
-  // RBF / learning 
-  int    zetta_ne_;                // samples per dimension (-> ne^8 total points)
-  double lambda_;                  // Gaussian width parameter
-  std::unique_ptr<CudaRBF> rbf_;   // CUDA/RBF
-  // bool freeze_weights_{false};
-  std::string wbar_bin_path_{"/home/soslab-p330/ros2_ws/wbar.bin"};
-
-
-  // Latest state
-  FullState latest_state_;
-  std::mutex state_mutex_;
-
-  /// Waypoint dynamics matrices (4x4, row-major)
-  std::array<double,16> A10_{};
-  std::array<double,16> A0_{};
-  std::array<double,16> B0_{};
-
-  // Waypoint generator pose/vel 
-  std::array<double,4>  p_{};
-  std::array<double,4>  v_{};
-  std::array<double,8> X_waypoint_{};
-
-  // Control variables 
-  std::array<double,4>  z1_{};
-  std::array<double,16> H1_{};
-  std::array<double,4>  beta_{};
-  std::array<double,4>  z2_{};
-
-  // Gains and outputs 
-  std::array<double,16> H2_{};
-  std::array<double,4>  tau_{};  //tau = F - H2*z2 - z1, in world frame
-  std::array<double,4> tau_body_{};
-  std::array<double,4>  F_{};  
-
-  // TF-related variables
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;                // a box that stores all transforms received
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;   // the little worker that listens to /tf and fills the buffer
-  std::string global_frame_{""};                              //  mauv_1/world
-  std::string odom_frame_{""};                                // learned from first odom message
+  // Frame and TF state
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::string global_frame_{""};
+  std::string odom_frame_{""};
   std::string base_frame_{};
   std::string tf_prefix_{};
 
-  // Thruster command filtering
-  std::array<double,4> thr_cmd_filt_{};  // initialized to {0,0,0,0}
-  double alpha_{0.2};                    // 0<alpha<=1; smaller = smoother
-  double alpha_heave_{0.05};             // smoother filtering for heave (tune this)
-  double alpha_surge_{0.02};             // smoother filtering for surge (tune this)  
-  double alpha_sway_{0.35};
-
-  // Normalization scales
-  double scale_pos_{1.0};      // 100.0   
-  double scale_ang_{1.0};      // PI
-  double scale_lin_{1.0};      // 2.0     
-  double scale_angvel_{1.0};   // 2.0
-  double scale_tau_{0.5};      // 0.5
-
-  // Centers 
-  // float rbf_lo_{-10.0f};
-  // float rbf_hi_{ 10.0f};
-  std::array<float, 8> rbf_lo8_{{-1,-1,-1,-1,-1,-1,-1,-1}};
-  std::array<float, 8> rbf_hi8_{{ 1, 1, 1, 1, 1, 1, 1, 1}};
-
-
-  // waypoints parameters
-  const double wx         = 0.005;
-  const double wy         = 2.0 * wx;   // 2.0 * wx;    
-  const double z_mid      = -2.0;   // center of [-3, -1]
-  const double z_amp      = 1.0;   // amplitude -> [-3, -1]
-  const double pitch_amp  = 0.15;  // rad -> +/-0.05
-
-  // Frequencies (small => small vz and pitch rate)
-  const double wz_traj    = 0.01;   // rad/s  (period ~ 314 s)
-  const double wp_traj    = 0.01;   // rad/s
-
-  // Make Z and Pitch undamped oscillators
-  const double kd_z       = 1.0;
-  const double zeta_pitch = 4.0;
-
-  // These are the "spring constants" in your B0_ matrix
-  const double kp_z       = 0.25; //wz_traj * wz_traj;     // = ωz^2
-  const double w_pitch    = 4.0; //wp_traj * wp_traj;     // = ωp^2
-
-  // This is the equilibrium point for Z
-  const double z_ref      = z_mid;  // important: center at -2
-
-  // Agent-specific formation offset
+  // Configuration parameters
   double offset_x_{0.0};
   double offset_y_{0.0};
   double offset_z_{0.0};
   double offset_pitch_{0.0};
+  double rotated_offset_x_{0.0};
+  double rotated_offset_y_{0.0};
+  double rotated_offset_z_{0.0};
+  double rotated_offset_pitch_{0.0};
+  double active_offset_x_{0.0};
+  double active_offset_y_{0.0};
+  double active_offset_z_{0.0};
+  double active_offset_pitch_{0.0};
+  std::vector<std::string> neighbor_names_;
 
-  // Local desired reference = leader trajectory + formation offset
-  std::array<double,4> p_ref_{};
-  std::array<double,4> v_ref_local_{}; 
-  
-  // Subscriptions
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  double scale_pos_{1.0};
+  double scale_ang_{1.0};
+  double scale_lin_{1.0};
+  double scale_angvel_{1.0};
+  double scale_tau_{0.5};
+  std::size_t steady_record_stride_{10};
 
-  // Thruster command publishers
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_heave_bow_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_heave_stern_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_surge_;
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_sway_bow_;
+  std::array<float, 8> rbf_lo8_{{-1, -1, -1, -1, -1, -1, -1, -1}};
+  std::array<float, 8> rbf_hi8_{{1, 1, 1, 1, 1, 1, 1, 1}};
 
-  // Visualization publishers
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_world_odom_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_wp_odom_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_z1_odom_; 
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_pi_p_;
-  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_actual_rpy_;
-  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_desired_rpy_;
-  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_z1_ang_;
+  // Waypoint parameters
+  const double wx         = 0.005;
+  const double wy         = 2.0 * wx;
+  const double z_mid      = -2.0;   // center of [-3, -1]
+  const double z_amp      = 1.0;    // amplitude -> [-3, -1]
 
-  // NN Weights (W:4*N) publishers
-  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_W_;
-  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_w_norms_;
+  // Z and pitch dynamics in the waypoint generator.
+  const double kd_z       = 1.0;
+  const double zeta_pitch = 4.0;
 
-  // Worker thread
-  std::thread processing_thread_;
+  const double kp_z       = 0.25;
+  const double w_pitch    = 4.0;
 
-  // Thruster frames (unprefixed; we'll prepend tf_prefix_ if present)
-  std::array<std::string,4> thr_links_{
+  const double z_ref_initial_ = z_mid;
+  double thrust_coeff_surge_{99.12};
+  double thrust_coeff_other_{57.26};
+
+  // Waypoint generator state
+  std::array<double, 16> A10_{};
+  std::array<double, 16> A0_{};
+  std::array<double, 16> B0_{};
+  std::array<double, 8> X_waypoint_{};
+  std::array<double, 4> p_{};
+  std::array<double, 4> v_{};
+  std::array<double, 4> p_ref_{};
+  std::array<double, 4> v_ref_local_{};
+
+  // Adaptive controller state
+  int zetta_ne_;                 // samples per dimension (-> ne^8 total points)
+  double lambda_;                // Gaussian width parameter
+  std::unique_ptr<CudaRBF> rbf_;
+  std::array<double, 16> H1_{};
+  std::array<double, 16> H2_{};
+  std::array<double, 4> z1_{};
+  std::array<double, 4> beta_{};
+  std::array<double, 4> z2_{};
+  std::array<double, 4> F_{};
+  std::array<double, 4> tau_{};       // tau = F - H2*z2 - z1, in world frame
+  std::array<double, 4> tau_body_{};
+  LearningPhase learning_phase_{LearningPhase::Learning};
+  KnowledgeSource knowledge_source_{KnowledgeSource::LocalAverage};
+  FormationProfile formation_profile_{FormationProfile::Training};
+  LearningPhase pending_learning_phase_{LearningPhase::Learning};
+  KnowledgeSource pending_knowledge_source_{KnowledgeSource::LocalAverage};
+  FormationProfile pending_formation_profile_{FormationProfile::Training};
+  bool has_pending_learning_phase_{false};
+  bool has_pending_knowledge_source_{false};
+  bool has_pending_formation_profile_{false};
+  std::mutex runtime_update_mutex_;
+  std::vector<double> steady_weight_sum_;
+  std::vector<float> steady_weight_snapshot_;
+  std::vector<float> frozen_weights_host_;
+  std::vector<float> shared_frozen_weights_host_;
+  std::size_t steady_sample_count_{0};
+  std::size_t steady_record_tick_{0};
+  bool frozen_weights_ready_{false};
+  bool shared_weights_ready_{false};
+  bool shared_weights_dirty_{false};
+  bool shared_weights_active_{false};
+  std::mutex shared_wbar_mutex_;
+  double previous_desired_yaw_{0.0};
+  bool previous_desired_yaw_valid_{false};
+
+  // Allocation and actuator state
+  std::array<std::string, 4> thr_links_{
     "surge_thruster_link",
     "heave_bow_thruster_link",
     "heave_stern_thruster_link",
     "sway_bow_thruster_link"
   };
+  double B_[6][4]{};
+  bool alloc_ready_{false};
+  std::array<double, 4> thr_force_{};
+  std::array<double, 4> thr_cmd_{};
 
-  // 6x4 allocation matrix B (body frame). Row-major: B[row:position dimension][col:thruster]
-  double B_[6][4]{};      
-  bool   alloc_ready_{false};
+  // Cached incoming data
+  FullState latest_state_;
+  std::mutex state_mutex_;
+  std::unordered_map<std::string, std::vector<float>> neighbor_weights_;
+  std::unordered_map<std::string, rclcpp::Time> neighbor_weight_stamps_;
+  std::mutex neighbor_weights_mutex_;
 
-  // thrust model (T = c |u| u) 
-  // double                thrust_coeff_{99.12};  
-  double thrust_coeff_surge_{99.12};
-  double thrust_coeff_other_{57.26};
- 
-  std::array<double, 4> thr_force_{};           
-  std::array<double, 4> thr_cmd_{};             
+  // ROS subscriptions
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+    parameter_callback_handle_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  std::vector<rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr>
+    neighbor_weight_subs_;
 
-  // Waypoint CSV logging (ONLY p_ and v_)
-  // std::ofstream  wp_csv_;
-  // bool           wp_log_{true};  // enable/disable
-  // std::string    wp_csv_path_{"/tmp/waypoint.csv"};
-  // int            wp_decim_{1};   // write every Nth loop (1 = every loop)
-  // size_t         wp_tick_{0};
+  // ROS publishers: thruster commands
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_heave_bow_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_heave_stern_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_surge_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_sway_bow_;
+
+  // ROS publishers: visualization and telemetry
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_world_odom_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_wp_odom_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_z1_odom_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_pi_p_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
+    pub_actual_rpy_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
+    pub_desired_rpy_;
+  rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_z1_ang_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_W_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_w_norms_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr
+    pub_local_frozen_wbar_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr
+    sub_shared_wbar_;
+
+  // Diagnostics and publish throttles
+  int weight_norm_publish_counter_{0};
+  std::size_t weight_publish_tick_{0};
 };
 
 // ============================================================================
-// main
+// ROS 2 Entry Point
 // ============================================================================
 
 int main(int argc , char **argv)
@@ -1751,8 +2208,3 @@ int main(int argc , char **argv)
   rclcpp::shutdown();
   return 0;
 }
-
-
-
-
-
