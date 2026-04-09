@@ -57,3 +57,157 @@ From the root of your ROS 2 workspace:
 cd ~/ros2_ws
 colcon build --packages-select simple_controller_pkg
 source install/setup.bash
+```
+
+## Learning Phase Control
+Each controller node exposes a runtime parameter called `learning_phase`.
+The supported values are:
+
+- `learning`
+- `steady_recording`
+- `frozen`
+
+The commands below switch all three agents together. They assume the
+controller nodes are running as:
+
+- `/mauv_1/simple_controller_node`
+- `/mauv_2/simple_controller_node`
+- `/mauv_3/simple_controller_node`
+
+### Start Steady Recording For All Agents
+This keeps learning active and starts collecting steady-phase weight samples
+inside each controller.
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node learning_phase steady_recording
+done
+```
+
+### Freeze Learning For All Agents
+This computes the averaged steady-phase weight `w_bar` for each agent,
+uploads it to the GPU, and disables further weight updates.
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node learning_phase frozen
+done
+```
+
+### Switch All Agents To Shared Swarm Knowledge
+After all three agents have frozen their local `w_bar`, the
+`swarm_weight_manager_node` computes:
+
+```text
+Wbar_shared = (Wbar_1 + Wbar_2 + Wbar_3) / 3
+```
+
+Use the command below to tell all agents to replace their local frozen
+knowledge with the shared swarm-average weight:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node knowledge_source swarm_average
+done
+```
+
+### Reuse The Saved Shared Weight On A Fresh Run
+To start directly with the saved shared swarm weight and no new learning:
+
+```bash
+ros2 launch simple_controller_pkg swarm_control.launch.py use_saved_shared_weights:=true
+```
+
+To start directly with the saved shared weight in the rotated formation:
+
+```bash
+ros2 launch simple_controller_pkg swarm_control.launch.py use_saved_shared_weights:=true formation_profile:=rotated
+```
+
+The saved files are:
+
+- `~/.ros/simple_controller/shared_wbar.bin`
+- `~/.ros/simple_controller/shared_wbar.meta`
+
+### Return All Agents To Local Frozen Knowledge
+If you want to switch back from the shared swarm average to each agent's own
+local frozen `w_bar`:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node knowledge_source local_average
+done
+```
+
+### Rotate The Formation For Transfer Testing
+This keeps the mission running, but changes the role/slot assignment so the
+agents test the learned knowledge in a new configuration:
+
+- `mauv_1` takes the old `mauv_2` slot
+- `mauv_2` takes the old `mauv_3` slot
+- `mauv_3` takes the old `mauv_1` slot
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node formation_profile rotated
+done
+```
+
+### Return To The Training Formation
+To restore the original learned/training configuration:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node formation_profile training
+done
+```
+
+### Return All Agents To Learning Mode
+This re-enables online weight updates for all agents.
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node learning_phase learning
+done
+```
+
+### Optional Check
+To confirm the current learning phase for all three agents:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param get /${agent}/simple_controller_node learning_phase
+done
+```
+
+To confirm the active knowledge source for all three agents:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param get /${agent}/simple_controller_node knowledge_source
+done
+```
+
+To fully confirm the runtime mode, check both:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  echo -n "${agent} phase: "
+  ros2 param get /${agent}/simple_controller_node learning_phase
+  echo -n "${agent} source: "
+  ros2 param get /${agent}/simple_controller_node knowledge_source
+done
+```
+
+To confirm the active formation profile for all three agents:
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param get /${agent}/simple_controller_node formation_profile
+done
+```
+
+### Important Note
+Do not switch to `frozen` before running `steady_recording` long enough to
+collect samples. If no steady-phase samples were recorded, the node will
+reject the freeze request and stay in its current mode.
