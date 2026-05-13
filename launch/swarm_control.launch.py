@@ -97,7 +97,7 @@ def launch_setup(context, *args, **kwargs):
         make_controller_node(
             "mauv_1",
             (0.0, 0.0, 0.0, 0.0),
-            (3.0, -3.0, 0.0, 0.0),
+            (10.5, -10.5, 0.0, 0.0),
             ["mauv_2"],
             learning_phase,
             knowledge_source,
@@ -105,8 +105,8 @@ def launch_setup(context, *args, **kwargs):
         ),
         make_controller_node(
             "mauv_2",
-            (3.0, -3.0, 0.0, 0.0),
-            (-3.0, 3.0, 0.0, 0.0),
+            (10.5, -10.5, 0.0, 0.0),
+            (-10.5, 10.5, 0.0, 0.0),
             ["mauv_1", "mauv_3"],
             learning_phase,
             knowledge_source,
@@ -114,7 +114,7 @@ def launch_setup(context, *args, **kwargs):
         ),
         make_controller_node(
             "mauv_3",
-            (-3.0, 3.0, 0.0, 0.0),
+            (-10.5, 10.5, 0.0, 0.0),
             (0.0, 0.0, 0.0, 0.0),
             ["mauv_2"],
             learning_phase,

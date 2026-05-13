@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 
+constexpr int kRbfDim = 6;
+
 // ---------------------------------------------------------------------------
 // C API Declarations
 // ---------------------------------------------------------------------------
@@ -23,14 +25,14 @@ extern "C" {
   cudaError_t rbf_freef(void* dS);
 
   // rbf_upload_xf
-  // Upload the current normalized 8-D query vector x.
-  cudaError_t rbf_upload_xf(const float x_host[8]);
+  // Upload the current normalized query vector x.
+  cudaError_t rbf_upload_xf(const float x_host[kRbfDim]);
 
-  // rbf_upload_bounds8f_async
+  // rbf_upload_boundsf_async
   // Upload the per-dimension lower bounds and step sizes.
-  cudaError_t rbf_upload_bounds8f_async(const float lo8_host[8],
-                                        const float step8_host[8],
-                                        cudaStream_t stream);
+  cudaError_t rbf_upload_boundsf_async(const float lo_host[kRbfDim],
+                                       const float step_host[kRbfDim],
+                                       cudaStream_t stream);
 
   // rbf_launchf
   // Launch the kernel that computes the current activation vector S(x).
@@ -99,28 +101,28 @@ extern "C" {
   // Center Table Helpers
   // -------------------------------------------------------------------------
 
-  // rbf_alloc_centers8f
-  // Allocate device storage for the explicit 8-D center table.
-  cudaError_t rbf_alloc_centers8f(void** dC8, uint64_t N);
+  // rbf_alloc_centersf
+  // Allocate device storage for the explicit center table.
+  cudaError_t rbf_alloc_centersf(void** dC, uint64_t N);
 
-  // rbf_build_centers8f
+  // rbf_build_centersf
   // Build the explicit center table from the implicit grid definition.
-  void rbf_build_centers8f(void* dC8,
-                            int ne,
-                            uint64_t N,
-                            cudaStream_t stream);
+  void rbf_build_centersf(void* dC,
+                          int ne,
+                          uint64_t N,
+                          cudaStream_t stream);
 
-  // rbf_download_centers8f
+  // rbf_download_centersf
   // Download the full center table from device memory.
-  cudaError_t rbf_download_centers8f(void* dC8,
-                                      float* C_host,
-                                      uint64_t N);
+  cudaError_t rbf_download_centersf(void* dC,
+                                    float* C_host,
+                                    uint64_t N);
 
-  // rbf_download_center8f
-  // Download a single 8-D center vector from device memory.
-  cudaError_t rbf_download_center8f(void* dC8,
-                                    uint64_t idx,
-                                    float out8_host[8]);
+  // rbf_download_centerf
+  // Download a single center vector from device memory.
+  cudaError_t rbf_download_centerf(void* dC,
+                                   uint64_t idx,
+                                   float out_host[kRbfDim]);
 }
 
 class CudaRBF {
@@ -129,24 +131,27 @@ class CudaRBF {
 
   // CudaRBF
   // Construct the CUDA-backed RBF helper and allocate device resources.
-  CudaRBF(int ne, const float lo8[8], const float hi8[8], float lambda)
+  CudaRBF(int ne,
+          const float lo[kRbfDim],
+          const float hi[kRbfDim],
+          float lambda)
       : ne_(ne), lambda_(lambda) {
-    for (int d = 0; d < 8; ++d) {
-      lo8_[d] = lo8[d];
-      hi8_[d] = hi8[d];
-      step8_[d] =
-          (ne_ <= 1) ? 0.0f : (hi8_[d] - lo8_[d]) / float(ne_ - 1);
+    for (int d = 0; d < kRbfDim; ++d) {
+      lo_[d] = lo[d];
+      hi_[d] = hi[d];
+      step_[d] =
+          (ne_ <= 1) ? 0.0f : (hi_[d] - lo_[d]) / float(ne_ - 1);
     }
 
     N_ = 1;
-    for (int d = 0; d < 8; ++d) {
+    for (int d = 0; d < kRbfDim; ++d) {
       N_ *= static_cast<uint64_t>(ne_);
     }
 
     bytes_S_ = static_cast<size_t>(N_) * sizeof(scalar_t);
     bytes_W4_ =
         static_cast<size_t>(4) * static_cast<size_t>(N_) * sizeof(scalar_t);
-    bytes_C8_ = static_cast<size_t>(N_) * 8 * sizeof(scalar_t);
+    bytes_C_ = static_cast<size_t>(N_) * kRbfDim * sizeof(scalar_t);
 
     cudaError_t e = cudaStreamCreate(&stream_);
     if (e != cudaSuccess) {
@@ -155,20 +160,20 @@ class CudaRBF {
       return;
     }
 
-    last_status_ = rbf_upload_bounds8f_async(lo8_, step8_, stream_);
+    last_status_ = rbf_upload_boundsf_async(lo_, step_, stream_);
     if (last_status_ != cudaSuccess) {
       cudaStreamDestroy(stream_);
       stream_ = nullptr;
       return;
     }
 
-    last_C8_ = rbf_alloc_centers8f(&dC8_, N_);
-    if (last_C8_ != cudaSuccess) {
-      dC8_ = nullptr;
+    last_C_ = rbf_alloc_centersf(&dC_, N_);
+    if (last_C_ != cudaSuccess) {
+      dC_ = nullptr;
     }
 
-    if (dC8_) {
-      rbf_build_centers8f(dC8_, ne_, N_, stream_);
+    if (dC_) {
+      rbf_build_centersf(dC_, ne_, N_, stream_);
       cudaStreamSynchronize(stream_);
     }
 
@@ -192,29 +197,29 @@ class CudaRBF {
   ~CudaRBF() {
     if (dS_) rbf_freef(dS_);
     if (dW4_) rbf_freef(dW4_);
-    if (dC8_) rbf_freef(dC8_);
+    if (dC_) rbf_freef(dC_);
     if (stream_) cudaStreamDestroy(stream_);
   }
 
   // download_center
   // Download one center vector from the explicit device center table.
-  cudaError_t download_center(uint64_t idx, float out8[8]) const {
-    if (!dC8_) return cudaErrorUnknown;
-    return rbf_download_center8f(dC8_, idx, out8);
+  cudaError_t download_center(uint64_t idx, float out[kRbfDim]) const {
+    if (!dC_) return cudaErrorUnknown;
+    return rbf_download_centerf(dC_, idx, out);
   }
 
   // download_centers
   // Download the full explicit center table into a host vector.
   cudaError_t download_centers(std::vector<float>& out) const {
-    if (!dC8_) return cudaErrorUnknown;
-    out.resize((size_t)N_ * 8);
-    return rbf_download_centers8f(dC8_, out.data(), N_);
+    if (!dC_) return cudaErrorUnknown;
+    out.resize((size_t)N_ * kRbfDim);
+    return rbf_download_centersf(dC_, out.data(), N_);
   }
 
   // ready
   // Report whether the CUDA resources required for this helper are ready.
   bool ready() const {
-    return (last_status_ == cudaSuccess) && dS_ && dW4_ && dC8_;
+    return (last_status_ == cudaSuccess) && dS_ && dW4_ && dC_;
   }
 
   // last_status
@@ -229,7 +234,7 @@ class CudaRBF {
   }
 
   // num_points
-  // Return the number of RBF points in the implicit 8-D grid.
+  // Return the number of RBF points in the implicit grid.
   std::uint64_t num_points() const { return N_; }
 
   // copy_W_to_host
@@ -276,8 +281,8 @@ class CudaRBF {
   const void* W4_device() const { return dW4_; }
 
   // compute_S
-  // Compute S(x) for the current 8-D normalized query.
-  void compute_S(const float x_host[8]) {
+  // Compute S(x) for the current normalized query.
+  void compute_S(const float x_host[kRbfDim]) {
     rbf_upload_xf(x_host);
     rbf_launchf(dS_, ne_, lambda_, N_, stream_);
   }
@@ -322,24 +327,24 @@ class CudaRBF {
  private:
   // Grid configuration.
   int ne_{0};
-  float lo8_[8] = {0};
-  float hi8_[8] = {0};
-  float step8_[8] = {0};
+  float lo_[kRbfDim] = {0};
+  float hi_[kRbfDim] = {0};
+  float step_[kRbfDim] = {0};
   scalar_t lambda_{1.5f};
   std::uint64_t N_{0};
 
   // Device buffers.
   void* dS_{nullptr};   // N floats
   void* dW4_{nullptr};  // 4 * N floats (w0..w3)
-  void* dC8_{nullptr};  // N * 8 floats
+  void* dC_{nullptr};   // N * kRbfDim floats
 
   // Buffer sizes and allocation status.
   std::size_t bytes_S_{0};
   std::size_t bytes_W4_{0};
-  std::size_t bytes_C8_{0};
+  std::size_t bytes_C_{0};
   cudaError_t last_S_{cudaSuccess};
   cudaError_t last_W4_{cudaSuccess};
-  cudaError_t last_C8_{cudaSuccess};
+  cudaError_t last_C_{cudaSuccess};
   cudaError_t last_status_{cudaSuccess};
 
   // CUDA stream used by this helper.

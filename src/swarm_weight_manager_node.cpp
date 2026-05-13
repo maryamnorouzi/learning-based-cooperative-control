@@ -16,6 +16,8 @@
 
 using std::placeholders::_1;
 
+constexpr int kRbfDim = 6;
+
 class SwarmWeightManagerNode : public rclcpp::Node
 {
 public:
@@ -24,26 +26,28 @@ public:
     agent_names_ = this->declare_parameter<std::vector<std::string>>(
       "agent_names",
       std::vector<std::string>{"mauv_1", "mauv_2", "mauv_3"});
-    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 5);
+    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 8);
     lambda_ = this->declare_parameter<double>("lambda", 0.2);
 
     const auto lo = this->declare_parameter<std::vector<double>>(
-      "rbf_lo8",
-      std::vector<double>(8, -1.0));
+      "rbf_lo6",
+      std::vector<double>(kRbfDim, -1.0));
     const auto hi = this->declare_parameter<std::vector<double>>(
-      "rbf_hi8",
-      std::vector<double>(8, 1.0));
+      "rbf_hi6",
+      std::vector<double>(kRbfDim, 1.0));
 
-    if (lo.size() != 8 || hi.size() != 8) {
+    if (lo.size() != static_cast<std::size_t>(kRbfDim) ||
+        hi.size() != static_cast<std::size_t>(kRbfDim)) {
       RCLCPP_WARN(
         get_logger(),
-        "rbf_lo8 and rbf_hi8 must each contain 8 values. "
-        "Falling back to [-1, 1] defaults for metadata validation.");
-      rbf_lo8_.assign(8, -1.0);
-      rbf_hi8_.assign(8, 1.0);
+        "rbf_lo6 and rbf_hi6 must each contain %d values. "
+        "Falling back to [-1, 1] defaults for metadata validation.",
+        kRbfDim);
+      rbf_lo_.assign(kRbfDim, -1.0);
+      rbf_hi_.assign(kRbfDim, 1.0);
     } else {
-      rbf_lo8_ = lo;
-      rbf_hi8_ = hi;
+      rbf_lo_ = lo;
+      rbf_hi_ = hi;
     }
 
     const std::filesystem::path default_storage_dir = default_storage_dir_();
@@ -107,7 +111,7 @@ private:
   std::size_t expected_weight_count_() const
   {
     uint64_t basis_count = 1;
-    for (int idx = 0; idx < 8; ++idx) {
+    for (int idx = 0; idx < kRbfDim; ++idx) {
       basis_count *= static_cast<uint64_t>(zetta_ne_);
     }
     return static_cast<std::size_t>(4 * basis_count);
@@ -206,13 +210,14 @@ private:
         return false;
       }
 
-      meta_stream << "version=1\n";
+      meta_stream << "version=2\n";
       meta_stream << "weight_count=" << shared_weights.size() << "\n";
       meta_stream << "zetta_ne=" << zetta_ne_ << "\n";
+      meta_stream << "rbf_dim=" << kRbfDim << "\n";
       meta_stream << std::setprecision(17)
                   << "lambda=" << lambda_ << "\n";
-      meta_stream << "rbf_lo8=" << join_vector_(rbf_lo8_) << "\n";
-      meta_stream << "rbf_hi8=" << join_vector_(rbf_hi8_) << "\n";
+      meta_stream << "rbf_lo6=" << join_vector_(rbf_lo_) << "\n";
+      meta_stream << "rbf_hi6=" << join_vector_(rbf_hi_) << "\n";
 
       if (!meta_stream) {
         RCLCPP_ERROR(
@@ -277,11 +282,31 @@ private:
         static_cast<std::size_t>(std::stoull(metadata.at("weight_count")));
       const int stored_zetta_ne = std::stoi(metadata.at("zetta_ne"));
       const double stored_lambda = std::stod(metadata.at("lambda"));
+      const auto stored_rbf_dim_it = metadata.find("rbf_dim");
+      if (stored_rbf_dim_it != metadata.end() &&
+          std::stoi(stored_rbf_dim_it->second) != kRbfDim) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Shared weight metadata was saved for a different RBF dimension. "
+          "Skipping auto-load.");
+        return false;
+      }
 
-      std::vector<double> stored_lo8;
-      std::vector<double> stored_hi8;
-      if (!parse_csv_doubles_(metadata.at("rbf_lo8"), stored_lo8) ||
-          !parse_csv_doubles_(metadata.at("rbf_hi8"), stored_hi8)) {
+      const auto lo_metadata_it = metadata.find("rbf_lo6");
+      const auto hi_metadata_it = metadata.find("rbf_hi6");
+      if (lo_metadata_it == metadata.end() || hi_metadata_it == metadata.end()) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Shared weight metadata file '%s' does not contain 6-D RBF bounds. "
+          "Skipping auto-load.",
+          meta_path.c_str());
+        return false;
+      }
+
+      std::vector<double> stored_lo;
+      std::vector<double> stored_hi;
+      if (!parse_csv_doubles_(lo_metadata_it->second, stored_lo) ||
+          !parse_csv_doubles_(hi_metadata_it->second, stored_hi)) {
         RCLCPP_WARN(
           get_logger(),
           "Shared weight metadata file '%s' contains invalid RBF bounds.",
@@ -293,8 +318,8 @@ private:
       if (stored_weight_count != expected_weight_count ||
           stored_zetta_ne != zetta_ne_ ||
           !nearly_equal_(stored_lambda, lambda_) ||
-          !nearly_equal_vectors_(stored_lo8, rbf_lo8_) ||
-          !nearly_equal_vectors_(stored_hi8, rbf_hi8_)) {
+          !nearly_equal_vectors_(stored_lo, rbf_lo_) ||
+          !nearly_equal_vectors_(stored_hi, rbf_hi_)) {
         RCLCPP_WARN(
           get_logger(),
           "Saved shared swarm w_bar metadata does not match the active controller "
@@ -446,10 +471,10 @@ private:
   }
 
   std::vector<std::string> agent_names_;
-  int zetta_ne_{5};
+  int zetta_ne_{8};
   double lambda_{0.2};
-  std::vector<double> rbf_lo8_{std::vector<double>(8, -1.0)};
-  std::vector<double> rbf_hi8_{std::vector<double>(8, 1.0)};
+  std::vector<double> rbf_lo_{std::vector<double>(kRbfDim, -1.0)};
+  std::vector<double> rbf_hi_{std::vector<double>(kRbfDim, 1.0)};
   std::string shared_wbar_save_path_;
   std::string shared_wbar_meta_path_;
   bool auto_save_shared_wbar_{true};
