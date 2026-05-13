@@ -25,6 +25,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <geometry_msgs/msg/accel_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -190,7 +191,7 @@ private:
     neighbor_names_ = this->declare_parameter<std::vector<std::string>>(
       "neighbor_names", std::vector<std::string>{});
 
-    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 5);
+    zetta_ne_ = this->declare_parameter<int>("zetta_ne", 8);
     lambda_   = this->declare_parameter<double>("lambda", 0.2);
     const int steady_record_stride =
       static_cast<int>(this->declare_parameter<int>("steady_record_stride", 10));
@@ -235,21 +236,23 @@ private:
     scale_tau_    = this->declare_parameter<double>("scale_tau",    scale_tau_);
 
     auto lo = this->declare_parameter<std::vector<double>>(
-         "rbf_lo8", std::vector<double>(8, -1.0));
+         "rbf_lo6", std::vector<double>(kRbfDim, -1.0));
     auto hi = this->declare_parameter<std::vector<double>>(
-         "rbf_hi8", std::vector<double>(8,  1.0));
+         "rbf_hi6", std::vector<double>(kRbfDim,  1.0));
 
-    if (lo.size() != 8 || hi.size() != 8) {
+    if (lo.size() != static_cast<std::size_t>(kRbfDim) ||
+        hi.size() != static_cast<std::size_t>(kRbfDim)) {
       RCLCPP_ERROR(get_logger(),
-        "rbf_lo8 and rbf_hi8 must each have exactly 8 elements. Got lo=%zu hi=%zu. Using defaults.",
+        "rbf_lo6 and rbf_hi6 must each have exactly %d elements. Got lo=%zu hi=%zu. Using defaults.",
+        kRbfDim,
         lo.size(), hi.size()); 
-      lo.assign(8, -1.0);
-      hi.assign(8,  1.0);
+      lo.assign(kRbfDim, -1.0);
+      hi.assign(kRbfDim,  1.0);
     }
 
-    for (int i = 0; i < 8; ++i) {
-      rbf_lo8_[i] = static_cast<float>(lo[i]);
-      rbf_hi8_[i] = static_cast<float>(hi[i]);
+    for (int i = 0; i < kRbfDim; ++i) {
+      rbf_lo_[i] = static_cast<float>(lo[i]);
+      rbf_hi_[i] = static_cast<float>(hi[i]);
     }
 
     apply_formation_profile_();
@@ -281,6 +284,13 @@ private:
     pub_z1_ang_      = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("z1_ang", 10);
     pub_actual_rpy_  = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("actual_rpy", 10);
     pub_desired_rpy_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("desired_rpy", 10);
+    pub_f_comparison_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+      "f_comparison", 10);
+
+    sub_actual_passive_accel_ = this->create_subscription<geometry_msgs::msg::AccelStamped>(
+      "stonefish/passive_accel",
+      10,
+      std::bind(&DataProcessorNode::actual_passive_accel_callback_, this, _1));
 
     sub_shared_wbar_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
       "/swarm/shared_wbar",
@@ -299,6 +309,111 @@ private:
       neighbor_weight_subs_.push_back(sub);
       RCLCPP_INFO(get_logger(), "Subscribed to neighbor weights: %s", topic_name.c_str());
     }
+  }
+
+  void actual_passive_accel_callback_(
+    const geometry_msgs::msg::AccelStamped::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(actual_passive_accel_mutex_);
+    actual_passive_accel_[0] = msg->accel.linear.x;
+    actual_passive_accel_[1] = msg->accel.linear.y;
+    actual_passive_accel_[2] = msg->accel.linear.z;
+    actual_passive_accel_[3] = msg->accel.angular.y;
+    has_actual_passive_accel_ = true;
+  }
+
+  bool compute_average_rbf_output_(std::array<double, 4>& output) {
+    if (!(rbf_ && rbf_->ready())) {
+      return false;
+    }
+
+    const std::uint64_t point_count = rbf_->num_points();
+    const std::size_t expected_weight_count =
+      static_cast<std::size_t>(4) * static_cast<std::size_t>(point_count);
+
+    std::vector<float> activation(point_count);
+    rbf_->copy_S_to_host(activation.data());
+    output.fill(0.0);
+
+    if (learning_phase_ == LearningPhase::SteadyRecording) {
+      if (steady_sample_count_ == 0 ||
+          steady_weight_sum_.size() != expected_weight_count) {
+        return false;
+      }
+
+      const double inv_sample_count =
+        1.0 / static_cast<double>(steady_sample_count_);
+      for (int channel = 0; channel < 4; ++channel) {
+        const std::size_t offset =
+          static_cast<std::size_t>(channel) * static_cast<std::size_t>(point_count);
+        double value = 0.0;
+        for (std::uint64_t j = 0; j < point_count; ++j) {
+          const double averaged_weight =
+            steady_weight_sum_[offset + static_cast<std::size_t>(j)] *
+            inv_sample_count;
+          value += averaged_weight * static_cast<double>(activation[j]);
+        }
+        output[channel] = value;
+      }
+      return true;
+    }
+
+    std::vector<float> averaged_weights;
+    if (learning_phase_ == LearningPhase::Frozen) {
+      if (knowledge_source_ == KnowledgeSource::SwarmAverage) {
+        std::lock_guard<std::mutex> lk(shared_wbar_mutex_);
+        if (!shared_weights_ready_ ||
+            shared_frozen_weights_host_.size() != expected_weight_count) {
+          return false;
+        }
+        averaged_weights = shared_frozen_weights_host_;
+      } else {
+        if (!frozen_weights_ready_ ||
+            frozen_weights_host_.size() != expected_weight_count) {
+          return false;
+        }
+        averaged_weights = frozen_weights_host_;
+      }
+    } else {
+      return false;
+    }
+
+    for (int channel = 0; channel < 4; ++channel) {
+      const std::size_t offset =
+        static_cast<std::size_t>(channel) * static_cast<std::size_t>(point_count);
+      double value = 0.0;
+      for (std::uint64_t j = 0; j < point_count; ++j) {
+        value += static_cast<double>(
+                   averaged_weights[offset + static_cast<std::size_t>(j)]) *
+                 static_cast<double>(activation[j]);
+      }
+      output[channel] = value;
+    }
+    return true;
+  }
+
+  void publish_f_comparison_(const std::array<double, 4>& estimate) {
+    if (!pub_f_comparison_) {
+      return;
+    }
+
+    std::array<double, 4> actual{};
+    {
+      std::lock_guard<std::mutex> lock(actual_passive_accel_mutex_);
+      if (!has_actual_passive_accel_) {
+        return;
+      }
+      actual = actual_passive_accel_;
+    }
+
+    std_msgs::msg::Float64MultiArray msg;
+    msg.data = {
+      estimate[0], actual[0], estimate[0] - actual[0],
+      estimate[1], actual[1], estimate[1] - actual[1],
+      estimate[2], actual[2], estimate[2] - actual[2],
+      estimate[3], actual[3], estimate[3] - actual[3]
+    };
+
+    pub_f_comparison_->publish(msg);
   }
 
   // --------------------------------------------------------------------------
@@ -333,7 +448,7 @@ private:
 
     // H2: velocity error -> control effort.
     H2_[WX*4 + WX]         = 200.0;
-    H2_[WYAW *4 + WYAW ]   = 200.0;  
+    H2_[WYAW *4 + WYAW ]   = 40.0;  
     H2_[WZ*4 + WZ]         = 300.0;  
     H2_[WPITCH*4 + WPITCH] = 100.0;
 
@@ -350,18 +465,18 @@ private:
       v_[i] = X_waypoint_[4 + i];
     }
 
-    float lo8[8], hi8[8];
-    for (int i = 0; i < 8; ++i) {
-      lo8[i] = rbf_lo8_[i];
-      hi8[i] = rbf_hi8_[i];
+    float lo[kRbfDim], hi[kRbfDim];
+    for (int i = 0; i < kRbfDim; ++i) {
+      lo[i] = rbf_lo_[i];
+      hi[i] = rbf_hi_[i];
     } 
 
-    rbf_ = std::make_unique<CudaRBF>(zetta_ne_, lo8, hi8, (float)lambda_);
+    rbf_ = std::make_unique<CudaRBF>(zetta_ne_, lo, hi, (float)lambda_);
     uint64_t N = 1;
-    for (int i = 0; i < 8; ++i) N *= static_cast<uint64_t>(zetta_ne_);
+    for (int i = 0; i < kRbfDim; ++i) N *= static_cast<uint64_t>(zetta_ne_);
     double mb = static_cast<double>(N) * sizeof(float) / (1024.0*1024.0);
-    RCLCPP_INFO(this->get_logger(), "RBF: ne=%d -> N=ne^8=%llu (%.2f MB buffer)",
-                zetta_ne_, static_cast<unsigned long long>(N), mb);
+    RCLCPP_INFO(this->get_logger(), "RBF: ne=%d -> N=ne^%d=%llu (%.2f MB buffer)",
+                zetta_ne_, kRbfDim, static_cast<unsigned long long>(N), mb);
 
     if (learning_phase_ == LearningPhase::SteadyRecording) {
       begin_steady_recording_();
@@ -477,7 +592,7 @@ private:
   uint64_t expected_weight_vector_size_() const
   {
     uint64_t N = 1;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kRbfDim; ++i) {
       N *= static_cast<uint64_t>(zetta_ne_);
     }
     return 4 * N;
@@ -1386,17 +1501,26 @@ private:
     }
   }
 
-  std::array<float, 8> build_rbf_input_(
+  std::array<float, kRbfDim> build_rbf_input_(
       const std::array<double, 12>& world_state_vector) const {
-    std::array<float, 8> rbf_input{};
-    rbf_input[0] = static_cast<float>(world_state_vector[X] / 100.0);
-    rbf_input[1] = static_cast<float>(world_state_vector[Y] / 50.0);
-    rbf_input[2] = static_cast<float>(world_state_vector[Z] / 10.0);
-    rbf_input[3] = static_cast<float>(world_state_vector[PITCH] * 5.0);
-    rbf_input[4] = static_cast<float>(world_state_vector[X + 6]);
-    rbf_input[5] = static_cast<float>(world_state_vector[Y + 6]);
-    rbf_input[6] = static_cast<float>(world_state_vector[Z + 6] * 2.0);
-    rbf_input[7] = static_cast<float>(world_state_vector[PITCH + 6] * 10.0);
+    std::array<float, kRbfDim> rbf_input{};
+
+    // Previous 8-D RBF input:
+    // rbf_input[0] = static_cast<float>(z1_[WX] / 100.0); // world_state_vector[X]
+    // rbf_input[1] = static_cast<float>(z1_[WY] / 50.0);  // world_state_vector[Y]
+    // rbf_input[2] = static_cast<float>(world_state_vector[Z] / 10.0);
+    // rbf_input[3] = static_cast<float>(world_state_vector[PITCH] * 5.0);
+    // rbf_input[4] = static_cast<float>(world_state_vector[X + 6]);
+    // rbf_input[5] = static_cast<float>(world_state_vector[Y + 6]);
+    // rbf_input[6] = static_cast<float>(world_state_vector[Z + 6] * 2.0);
+    // rbf_input[7] = static_cast<float>(world_state_vector[PITCH + 6] * 10.0);
+
+    rbf_input[0] = static_cast<float>(world_state_vector[Z] / 10.0);
+    rbf_input[1] = static_cast<float>(world_state_vector[PITCH] * 5.0);
+    rbf_input[2] = static_cast<float>(world_state_vector[X + 6]);
+    rbf_input[3] = static_cast<float>(world_state_vector[Y + 6]);
+    rbf_input[4] = static_cast<float>(world_state_vector[Z + 6] * 2.0);
+    rbf_input[5] = static_cast<float>(world_state_vector[PITCH + 6] * 10.0);
     return rbf_input;
   }
 
@@ -1463,7 +1587,7 @@ private:
     pub_W_->publish(msg);
   }
 
-  void update_rbf_controller_(const std::array<float, 8>& rbf_input) {
+  void update_rbf_controller_(const std::array<float, kRbfDim>& rbf_input) {
     if (!(rbf_ && rbf_->ready())) {
       return;
     }
@@ -1491,13 +1615,13 @@ private:
     //       }
     //     }
     //
-    //     float center[8];
+    //     float center[kRbfDim];
     //     if (rbf_->download_center(idx_max, center) == cudaSuccess) {
     //       // RCLCPP_INFO(get_logger(),
-    //       //   "S: min=%.3e max=%.3e idx_max=%llu center=[%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f]",
+    //       //   "S: min=%.3e max=%.3e idx_max=%llu center=[%.1f %.1f %.1f %.1f %.1f %.1f]",
     //       //   minS, maxS, (unsigned long long)idx_max,
     //       //   center[0], center[1], center[2], center[3],
-    //       //   center[4], center[5], center[6], center[7]);
+    //       //   center[4], center[5]);
     //     }
     //   }
     // }
@@ -1578,6 +1702,15 @@ private:
       record_steady_weight_sample_();
     }
 
+    std::array<double, 4> averaged_output{};
+    if (compute_average_rbf_output_(averaged_output)) {
+      publish_f_comparison_(averaged_output);
+    } else {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 20000,
+        "Waiting for averaged RBF weights before publishing f_comparison.");
+    }
+
     publish_weight_norms_();
   }
 
@@ -1647,7 +1780,7 @@ private:
 
   void log_controller_state_(const WorldFrameState& world_state,
                             const HeadingReference& reference,
-                            const std::array<float, 8>& rbf_input) {
+                            const std::array<float, kRbfDim>& rbf_input) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 20000,
       "learning_phase=%s steady_samples=%zu knowledge_source=%s formation_profile=%s",
@@ -1673,9 +1806,9 @@ private:
 
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 20000,
-      "x_f=[%.1f %.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
-      rbf_input[0], rbf_input[1], rbf_input[2], rbf_input[3],
-      rbf_input[4], rbf_input[5], rbf_input[6], rbf_input[7]);
+      "x_f=[%.3f %.3f %.3f %.3f %.3f %.3f]",
+      rbf_input[0], rbf_input[1], rbf_input[2],
+      rbf_input[3], rbf_input[4], rbf_input[5]);
 
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 20000,
@@ -1807,7 +1940,8 @@ private:
       world_state.twist[YAW]
     };
 
-    const std::array<float, 8> rbf_input = build_rbf_input_(world_state_vector);
+    const std::array<float, kRbfDim> rbf_input =
+      build_rbf_input_(world_state_vector);
     update_rbf_controller_(rbf_input);
     publish_weights_for_neighbors_();
 
@@ -2076,8 +2210,8 @@ private:
   double scale_tau_{0.5};
   std::size_t steady_record_stride_{10};
 
-  std::array<float, 8> rbf_lo8_{{-1, -1, -1, -1, -1, -1, -1, -1}};
-  std::array<float, 8> rbf_hi8_{{1, 1, 1, 1, 1, 1, 1, 1}};
+  std::array<float, kRbfDim> rbf_lo_{{-1, -1, -1, -1, -1, -1}};
+  std::array<float, kRbfDim> rbf_hi_{{1, 1, 1, 1, 1, 1}};
 
   // Waypoint parameters
   const double wx         = 0.005;
@@ -2107,7 +2241,7 @@ private:
   std::array<double, 4> v_ref_local_{};
 
   // Adaptive controller state
-  int zetta_ne_;                 // samples per dimension (-> ne^8 total points)
+  int zetta_ne_;                 // samples per dimension (-> ne^6 total points)
   double lambda_;                // Gaussian width parameter
   std::unique_ptr<CudaRBF> rbf_;
   std::array<double, 16> H1_{};
@@ -2157,6 +2291,9 @@ private:
   // Cached incoming data
   FullState latest_state_;
   std::mutex state_mutex_;
+  std::array<double, 4> actual_passive_accel_{};
+  std::mutex actual_passive_accel_mutex_;
+  bool has_actual_passive_accel_{false};
   std::unordered_map<std::string, std::vector<float>> neighbor_weights_;
   std::unordered_map<std::string, rclcpp::Time> neighbor_weight_stamps_;
   std::mutex neighbor_weights_mutex_;
@@ -2165,6 +2302,8 @@ private:
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
     parameter_callback_handle_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::AccelStamped>::SharedPtr
+    sub_actual_passive_accel_;
   std::vector<rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr>
     neighbor_weight_subs_;
 
@@ -2184,6 +2323,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
     pub_desired_rpy_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_z1_ang_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
+    pub_f_comparison_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_W_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_w_norms_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr

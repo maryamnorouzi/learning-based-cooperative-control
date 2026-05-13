@@ -12,10 +12,10 @@ using T = float;
 // Device Constants
 // ---------------------------------------------------------------------------
 
-__constant__ T c_x[8];
+__constant__ T c_x[kRbfDim];
 __constant__ T c_z2[4];
-__constant__ T c_lo[8];
-__constant__ T c_step[8];
+__constant__ T c_lo[kRbfDim];
+__constant__ T c_step[kRbfDim];
 
 // RBF update flow:
 // 1. `rbf_kernel` computes the current basis activations S(x).
@@ -31,7 +31,7 @@ __constant__ T c_step[8];
 // ---------------------------------------------------------------------------
 
 // rbf_kernel
-// Compute the current activation vector S(x) over the full 8-D center grid.
+// Compute the current activation vector S(x) over the full center grid.
 __global__ void rbf_kernel(
     T* S,
     int ne,
@@ -43,8 +43,8 @@ __global__ void rbf_kernel(
     uint64_t q = i;
     T d2 = 0.0f;
 
-    #pragma unroll 8
-    for (int d = 0; d < 8; ++d) {
+    #pragma unroll
+    for (int d = 0; d < kRbfDim; ++d) {
         int digit = (int)(q % (uint64_t)ne);
         q /= (uint64_t)ne;
 
@@ -57,9 +57,9 @@ __global__ void rbf_kernel(
 }
 
 // centers_kernel
-// Expand the implicit 8-D grid definition into an explicit center table.
+// Expand the implicit grid definition into an explicit center table.
 __global__ void centers_kernel(
-    float* C8,
+    float* C,
     int ne,
     uint64_t N) {
     uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -67,11 +67,11 @@ __global__ void centers_kernel(
 
     uint64_t q = i;
 
-    #pragma unroll 8
-    for (int d = 0; d < 8; ++d) {
+    #pragma unroll
+    for (int d = 0; d < kRbfDim; ++d) {
         int digit = (int)(q % (uint64_t)ne);
         q /= (uint64_t)ne;
-        C8[i * 8 + d] = c_lo[d] + (float)digit * c_step[d];
+        C[i * kRbfDim + d] = c_lo[d] + (float)digit * c_step[d];
     }
 }
 
@@ -152,31 +152,31 @@ __global__ void dot_w4_kernel(const T* __restrict__ W4,
 // C API: Grid And Activation Helpers
 // ---------------------------------------------------------------------------
 
-// rbf_upload_bounds8f_async
+// rbf_upload_boundsf_async
 // Upload the per-dimension lower bounds and step sizes to constant memory.
-extern "C" cudaError_t rbf_upload_bounds8f_async(const float lo8_host[8],
-                                                const float step8_host[8],
+extern "C" cudaError_t rbf_upload_boundsf_async(const float lo_host[kRbfDim],
+                                                const float step_host[kRbfDim],
                                                 cudaStream_t stream) {
-    cudaError_t e = cudaMemcpyToSymbolAsync(c_lo, lo8_host, 8 * sizeof(T), 0,
+    cudaError_t e = cudaMemcpyToSymbolAsync(c_lo, lo_host, kRbfDim * sizeof(T), 0,
                                                 cudaMemcpyHostToDevice, stream);
     if (e != cudaSuccess) return e;
 
-    return cudaMemcpyToSymbolAsync(c_step, step8_host, 8 * sizeof(T), 0,
+    return cudaMemcpyToSymbolAsync(c_step, step_host, kRbfDim * sizeof(T), 0,
                                     cudaMemcpyHostToDevice, stream);
 }
 
-// rbf_build_centers8f
+// rbf_build_centersf
 // Launch the kernel that builds the explicit center table on the device.
-extern "C" void rbf_build_centers8f(void* dC8,
-                                    int ne,
-                                    uint64_t N,
-                                    cudaStream_t stream) {
-    if (!dC8) return;
+extern "C" void rbf_build_centersf(void* dC,
+                                   int ne,
+                                   uint64_t N,
+                                   cudaStream_t stream) {
+    if (!dC) return;
 
     const int threads = 256;
     const int blocks = (int)((N + threads - 1) / threads);
 
-    centers_kernel<<<blocks, threads, 0, stream>>>((float*)dC8, ne, N);
+    centers_kernel<<<blocks, threads, 0, stream>>>((float*)dC, ne, N);
 
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
@@ -184,32 +184,32 @@ extern "C" void rbf_build_centers8f(void* dC8,
     }
 }
 
-// rbf_alloc_centers8f
-// Allocate device storage for the full 8-D center table.
-extern "C" cudaError_t rbf_alloc_centers8f(void** dC8, uint64_t N) {
-    if (!dC8) return cudaErrorInvalidValue;
-    return cudaMalloc(dC8, (size_t)N * 8 * sizeof(float));
+// rbf_alloc_centersf
+// Allocate device storage for the full center table.
+extern "C" cudaError_t rbf_alloc_centersf(void** dC, uint64_t N) {
+    if (!dC) return cudaErrorInvalidValue;
+    return cudaMalloc(dC, (size_t)N * kRbfDim * sizeof(float));
 }
 
-// rbf_download_centers8f
+// rbf_download_centersf
 // Download the full center table from device memory to the host.
-extern "C" cudaError_t rbf_download_centers8f(void* dC8,
-                                                float* C_host,
-                                                uint64_t N) {
-    if (!dC8 || !C_host) return cudaErrorInvalidValue;
-    return cudaMemcpy(C_host, dC8, (size_t)N * 8 * sizeof(float),
+extern "C" cudaError_t rbf_download_centersf(void* dC,
+                                             float* C_host,
+                                             uint64_t N) {
+    if (!dC || !C_host) return cudaErrorInvalidValue;
+    return cudaMemcpy(C_host, dC, (size_t)N * kRbfDim * sizeof(float),
                         cudaMemcpyDeviceToHost);
 }
 
-// rbf_download_center8f
-// Download a single 8-D center vector from device memory to the host.
-extern "C" cudaError_t rbf_download_center8f(void* dC8,
+// rbf_download_centerf
+// Download a single center vector from device memory to the host.
+extern "C" cudaError_t rbf_download_centerf(void* dC,
                                             uint64_t idx,
-                                            float out8_host[8]) {
-    if (!dC8 || !out8_host) return cudaErrorInvalidValue;
-    return cudaMemcpy(out8_host,
-                        ((float*)dC8) + idx * 8,
-                        8 * sizeof(float),
+                                            float out_host[kRbfDim]) {
+    if (!dC || !out_host) return cudaErrorInvalidValue;
+    return cudaMemcpy(out_host,
+                        ((float*)dC) + idx * kRbfDim,
+                        kRbfDim * sizeof(float),
                         cudaMemcpyDeviceToHost);
 }
 
@@ -227,8 +227,8 @@ extern "C" cudaError_t rbf_freef(void* dS) {
 
 // rbf_upload_xf
 // Upload the current normalized query vector x to constant memory.
-extern "C" cudaError_t rbf_upload_xf(const float x_host[8]) {
-  return cudaMemcpyToSymbol(c_x, x_host, 8 * sizeof(T), 0,
+extern "C" cudaError_t rbf_upload_xf(const float x_host[kRbfDim]) {
+  return cudaMemcpyToSymbol(c_x, x_host, kRbfDim * sizeof(T), 0,
                             cudaMemcpyHostToDevice);
 }
 
