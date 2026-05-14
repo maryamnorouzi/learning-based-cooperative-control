@@ -27,6 +27,7 @@ def make_controller_node(
     learning_phase,
     knowledge_source,
     formation_profile,
+    mission_profile,
 ):
     """Create one namespaced controller node for a swarm vehicle."""
 
@@ -52,6 +53,7 @@ def make_controller_node(
                 "learning_phase": learning_phase,
                 "knowledge_source": knowledge_source,
                 "formation_profile": formation_profile,
+                "mission_profile": mission_profile,
             }
         ],
     )
@@ -64,6 +66,7 @@ def launch_setup(context, *args, **kwargs):
         == "true"
     )
     formation_profile = LaunchConfiguration("formation_profile").perform(context)
+    mission_profile = LaunchConfiguration("mission_profile").perform(context)
     shared_wbar_save_path = LaunchConfiguration("shared_wbar_save_path").perform(
         context
     )
@@ -102,6 +105,7 @@ def launch_setup(context, *args, **kwargs):
             learning_phase,
             knowledge_source,
             formation_profile,
+            mission_profile,
         ),
         make_controller_node(
             "mauv_2",
@@ -111,6 +115,7 @@ def launch_setup(context, *args, **kwargs):
             learning_phase,
             knowledge_source,
             formation_profile,
+            mission_profile,
         ),
         make_controller_node(
             "mauv_3",
@@ -120,6 +125,7 @@ def launch_setup(context, *args, **kwargs):
             learning_phase,
             knowledge_source,
             formation_profile,
+            mission_profile,
         ),
     ]
 
@@ -147,6 +153,13 @@ def generate_launch_description():
             "formation_profile",
             default_value="training",
             description="Initial formation profile: training or rotated.",
+        ),
+        DeclareLaunchArgument(
+            "mission_profile",
+            default_value="figure_eight",
+            description=(
+                "Initial mission profile: figure_eight or quarter_square_hold."
+            ),
         ),
         DeclareLaunchArgument(
             "shared_wbar_save_path",

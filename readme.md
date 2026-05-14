@@ -162,6 +162,50 @@ for agent in mauv_1 mauv_2 mauv_3; do
 done
 ```
 
+## Mission Selection
+Each controller node also exposes a runtime parameter called
+`mission_profile`.
+The supported values are:
+
+- `figure_eight`
+- `quarter_square_hold`
+
+The default mission remains `figure_eight`.
+The new `quarter_square_hold` mission moves along a smooth square-corner
+path and then holds the final point.
+
+### Start The Quarter-Square Mission At Launch
+
+```bash
+ros2 launch simple_controller_pkg swarm_control.launch.py mission_profile:=quarter_square_hold
+```
+
+### Switch All Agents To The Quarter-Square Mission At Runtime
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node mission_profile quarter_square_hold
+done
+```
+
+### Return All Agents To The Figure-Eight Mission
+
+```bash
+for agent in mauv_1 mauv_2 mauv_3; do
+  ros2 param set /${agent}/simple_controller_node mission_profile figure_eight
+done
+```
+
+The quarter-square geometry and timing are configured in
+`config/swarm_control.yaml` using:
+
+- `quarter_square_origin_x`
+- `quarter_square_origin_y`
+- `quarter_square_side_length`
+- `quarter_square_turn_radius`
+- `quarter_square_leg_time`
+- `quarter_square_turn_time`
+
 ### Return All Agents To Learning Mode
 This re-enables online weight updates for all agents.
 
