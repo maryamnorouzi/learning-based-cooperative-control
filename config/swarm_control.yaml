@@ -18,6 +18,13 @@
     offset_y: 0.0
     offset_z: 0.0
     offset_pitch: 0.0
+    mission_profile: figure_eight
+    quarter_square_origin_x: 0.0
+    quarter_square_origin_y: 0.0
+    quarter_square_side_length: 30.0
+    quarter_square_turn_radius: 7.5
+    quarter_square_leg_time: 80.0
+    quarter_square_turn_time: 50.0
     zetta_ne: 8
     lambda: 0.2
     rbf_lo6: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]

@@ -128,6 +128,11 @@ private:
     Rotated
   };
 
+  enum class MissionProfile {
+    FigureEight,
+    QuarterSquareHold
+  };
+
   // --------------------------------------------------------------------------
   // TF setup
   // --------------------------------------------------------------------------
@@ -227,6 +232,30 @@ private:
         formation_profile_name.c_str());
       formation_profile_ = FormationProfile::Training;
     }
+
+    const std::string mission_profile_name =
+      this->declare_parameter<std::string>("mission_profile", "figure_eight");
+    if (!parse_mission_profile_(mission_profile_name, mission_profile_)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Invalid initial mission_profile '%s'. Falling back to 'figure_eight'.",
+        mission_profile_name.c_str());
+      mission_profile_ = MissionProfile::FigureEight;
+    }
+
+    quarter_square_origin_x_ = this->declare_parameter<double>(
+      "quarter_square_origin_x", quarter_square_origin_x_);
+    quarter_square_origin_y_ = this->declare_parameter<double>(
+      "quarter_square_origin_y", quarter_square_origin_y_);
+    quarter_square_side_length_ = this->declare_parameter<double>(
+      "quarter_square_side_length", quarter_square_side_length_);
+    quarter_square_turn_radius_ = this->declare_parameter<double>(
+      "quarter_square_turn_radius", quarter_square_turn_radius_);
+    quarter_square_leg_time_ = this->declare_parameter<double>(
+      "quarter_square_leg_time", quarter_square_leg_time_);
+    quarter_square_turn_time_ = this->declare_parameter<double>(
+      "quarter_square_turn_time", quarter_square_turn_time_);
+    sanitize_mission_parameters_();
 
     // Scaling values
     scale_pos_    = this->declare_parameter<double>("scale_pos",    scale_pos_);
@@ -432,8 +461,6 @@ private:
     A0_[WZ*4 + WZ]         = -kd_z;       
     A0_[WPITCH*4 + WPITCH] = -zeta_pitch;
 
-    B0_[WX*4 + WX]         = -wx*wx;         // X'' = -wx^2 X
-    B0_[WY*4 + WY]         = -wy*wy;         // Y'' = -wy^2 Y
     B0_[WZ*4 + WZ]         = -kp_z;          // Z'' += -kp_z * Z
     B0_[WPITCH*4 + WPITCH] = -w_pitch;       // Pitch'' += -w_pitch * Pitch
 
@@ -452,18 +479,7 @@ private:
     H2_[WZ*4 + WZ]         = 300.0;  
     H2_[WPITCH*4 + WPITCH] = 100.0;
 
-    // Initial conditions for the figure-eight waypoint generator.
-    const double A = 100.0;   // X amplitude (meters)
-    const double B = 50.0;    // Y amplitude (meters)
-    const std::array<double,4> q0  = { 0.0, 0.0, z_ref_initial_, 0.0 };
-    const std::array<double,4> qd0 = { A*wx, B*wy, 0.0, 0.0};      
-
-    for (int i=0; i<4; ++i) {
-      X_waypoint_[i]    = q0[i];
-      X_waypoint_[4+i]  = qd0[i];
-      p_[i] = X_waypoint_[i];   
-      v_[i] = X_waypoint_[4 + i];
-    }
+    reset_waypoint_generator_for_active_mission_();
 
     float lo[kRbfDim], hi[kRbfDim];
     for (int i = 0; i < kRbfDim; ++i) {
@@ -635,6 +651,17 @@ private:
     return "training";
   }
 
+  static const char* mission_profile_to_string_(MissionProfile profile)
+  {
+    switch (profile) {
+      case MissionProfile::FigureEight:
+        return "figure_eight";
+      case MissionProfile::QuarterSquareHold:
+        return "quarter_square_hold";
+    }
+    return "figure_eight";
+  }
+
   static bool parse_formation_profile_(
       const std::string& profile_name,
       FormationProfile& profile)
@@ -645,6 +672,21 @@ private:
     }
     if (profile_name == "rotated") {
       profile = FormationProfile::Rotated;
+      return true;
+    }
+    return false;
+  }
+
+  static bool parse_mission_profile_(
+      const std::string& profile_name,
+      MissionProfile& profile)
+  {
+    if (profile_name == "figure_eight") {
+      profile = MissionProfile::FigureEight;
+      return true;
+    }
+    if (profile_name == "quarter_square_hold") {
+      profile = MissionProfile::QuarterSquareHold;
       return true;
     }
     return false;
@@ -699,6 +741,93 @@ private:
         active_offset_pitch_ = rotated_offset_pitch_;
         break;
     }
+  }
+
+  void sanitize_mission_parameters_()
+  {
+    if (quarter_square_side_length_ <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "quarter_square_side_length must be positive. Using 30.0 m.");
+      quarter_square_side_length_ = 30.0;
+    }
+
+    if (quarter_square_turn_radius_ < 0.0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "quarter_square_turn_radius cannot be negative. Using 0.0 m.");
+      quarter_square_turn_radius_ = 0.0;
+    }
+
+    if (quarter_square_turn_radius_ > quarter_square_side_length_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "quarter_square_turn_radius %.3f exceeds side length %.3f. Clamping to the side length.",
+        quarter_square_turn_radius_,
+        quarter_square_side_length_);
+      quarter_square_turn_radius_ = quarter_square_side_length_;
+    }
+
+    if (quarter_square_leg_time_ <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "quarter_square_leg_time must be positive. Using 80.0 s.");
+      quarter_square_leg_time_ = 80.0;
+    }
+
+    if (quarter_square_turn_time_ <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "quarter_square_turn_time must be positive. Using 50.0 s.");
+      quarter_square_turn_time_ = 50.0;
+    }
+  }
+
+  void reset_waypoint_generator_for_active_mission_()
+  {
+    B0_[WX*4 + WX] = 0.0;
+    B0_[WY*4 + WY] = 0.0;
+
+    std::array<double, 4> q0 = {0.0, 0.0, z_ref_initial_, 0.0};
+    std::array<double, 4> qd0 = {0.0, 0.0, 0.0, 0.0};
+
+    switch (mission_profile_) {
+      case MissionProfile::FigureEight:
+        B0_[WX*4 + WX] = -wx * wx;
+        B0_[WY*4 + WY] = -wy * wy;
+        qd0[WX] = figure_eight_amplitude_x_ * wx;
+        qd0[WY] = figure_eight_amplitude_y_ * wy;
+        break;
+
+      case MissionProfile::QuarterSquareHold:
+        q0[WX] = quarter_square_origin_x_;
+        q0[WY] = quarter_square_origin_y_;
+        break;
+    }
+
+    sim_time_ = 0.0;
+    previous_desired_yaw_ = 0.0;
+    previous_desired_yaw_valid_ = false;
+    last_path_heading_ = 0.0;
+    last_path_heading_valid_ = false;
+
+    X_waypoint_.fill(0.0);
+    for (int i = 0; i < 4; ++i) {
+      X_waypoint_[i] = q0[i];
+      X_waypoint_[4 + i] = qd0[i];
+      p_[i] = q0[i];
+      v_[i] = qd0[i];
+    }
+
+    p_ref_[WX] = p_[WX] + active_offset_x_;
+    p_ref_[WY] = p_[WY] + active_offset_y_;
+    p_ref_[WZ] = p_[WZ] + active_offset_z_;
+    p_ref_[WPITCH] = p_[WPITCH] + active_offset_pitch_;
+
+    v_ref_local_[WX] = v_[WX];
+    v_ref_local_[WY] = v_[WY];
+    v_ref_local_[WZ] = v_[WZ];
+    v_ref_local_[WPITCH] = v_[WPITCH];
   }
 
   void shared_wbar_callback_(
@@ -793,6 +922,26 @@ private:
         std::lock_guard<std::mutex> lk(runtime_update_mutex_);
         pending_formation_profile_ = requested_profile;
         has_pending_formation_profile_ = true;
+      }
+
+      if (parameter.get_name() == "mission_profile") {
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
+          result.successful = false;
+          result.reason = "mission_profile must be a string.";
+          return result;
+        }
+
+        MissionProfile requested_mission = MissionProfile::FigureEight;
+        if (!parse_mission_profile_(parameter.as_string(), requested_mission)) {
+          result.successful = false;
+          result.reason =
+            "mission_profile must be one of: figure_eight, quarter_square_hold.";
+          return result;
+        }
+
+        std::lock_guard<std::mutex> lk(runtime_update_mutex_);
+        pending_mission_profile_ = requested_mission;
+        has_pending_mission_profile_ = true;
       }
 
     }
@@ -974,23 +1123,28 @@ private:
     LearningPhase requested_phase = learning_phase_;
     KnowledgeSource requested_source = knowledge_source_;
     FormationProfile requested_profile = formation_profile_;
+    MissionProfile requested_mission = mission_profile_;
     bool has_pending_phase = false;
     bool has_pending_source = false;
     bool has_pending_profile = false;
+    bool has_pending_mission = false;
 
     {
       std::lock_guard<std::mutex> lk(runtime_update_mutex_);
       has_pending_phase = has_pending_learning_phase_;
       has_pending_source = has_pending_knowledge_source_;
       has_pending_profile = has_pending_formation_profile_;
+      has_pending_mission = has_pending_mission_profile_;
 
       requested_phase = pending_learning_phase_;
       requested_source = pending_knowledge_source_;
       requested_profile = pending_formation_profile_;
+      requested_mission = pending_mission_profile_;
 
       has_pending_learning_phase_ = false;
       has_pending_knowledge_source_ = false;
       has_pending_formation_profile_ = false;
+      has_pending_mission_profile_ = false;
     }
 
     if (has_pending_profile && requested_profile != formation_profile_) {
@@ -1000,6 +1154,15 @@ private:
         get_logger(),
         "Formation profile switched to '%s'.",
         formation_profile_to_string_(formation_profile_));
+    }
+
+    if (has_pending_mission && requested_mission != mission_profile_) {
+      mission_profile_ = requested_mission;
+      reset_waypoint_generator_for_active_mission_();
+      RCLCPP_INFO(
+        get_logger(),
+        "Mission profile switched to '%s'.",
+        mission_profile_to_string_(mission_profile_));
     }
 
     if (has_pending_phase && requested_phase != learning_phase_) {
@@ -1341,9 +1504,21 @@ private:
       double dt) {
     HeadingReference reference;
     constexpr double kLookaheadDistance = 5.0;
+    constexpr double kHeadingSpeedEps = 1e-4;
     const double lookahead_gain = 1.0 / kLookaheadDistance;
+    const double planar_speed = std::hypot(v_[WX], v_[WY]);
 
-    reference.path_heading = wrapToPi(std::atan2(v_[WY], v_[WX]));
+    if (planar_speed > kHeadingSpeedEps) {
+      reference.path_heading = wrapToPi(std::atan2(v_[WY], v_[WX]));
+      last_path_heading_ = reference.path_heading;
+      last_path_heading_valid_ = true;
+    } else if (last_path_heading_valid_) {
+      reference.path_heading = last_path_heading_;
+    } else if (previous_desired_yaw_valid_) {
+      reference.path_heading = previous_desired_yaw_;
+    } else {
+      reference.path_heading = 0.0;
+    }
 
     const double ex = pose_world[X] - p_ref_[WX];
     const double ey = pose_world[Y] - p_ref_[WY];
@@ -1783,11 +1958,12 @@ private:
                             const std::array<float, kRbfDim>& rbf_input) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 20000,
-      "learning_phase=%s steady_samples=%zu knowledge_source=%s formation_profile=%s",
+      "learning_phase=%s steady_samples=%zu knowledge_source=%s formation_profile=%s mission_profile=%s",
       learning_phase_to_string_(learning_phase_),
       steady_sample_count_,
       knowledge_source_to_string_(knowledge_source_),
-      formation_profile_to_string_(formation_profile_));
+      formation_profile_to_string_(formation_profile_),
+      mission_profile_to_string_(mission_profile_));
 
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), 20000,
@@ -2008,6 +2184,10 @@ private:
     s = clamp(s, 0.0, 1.0);
     return 30*s*s - 60*s*s*s + 30*s*s*s*s;
   }
+  static inline double smooth5_d2(double s) {
+    s = clamp(s, 0.0, 1.0);
+    return 60*s - 180*s*s + 120*s*s*s;
+  }
 
   // Z reference with dwell + smooth moves.
   inline void z_pitch_ref(double t, double &z_ref, double &dz_ref,
@@ -2053,6 +2233,92 @@ private:
     // Pitch tracking is currently disabled.
     pitch_ref = 0.0;
     dpitch_ref = 0.0;
+  }
+
+  void quarter_square_xy_ref_(
+      double t,
+      double& x_ref,
+      double& dx_ref,
+      double& ddx_ref,
+      double& y_ref,
+      double& dy_ref,
+      double& ddy_ref) const
+  {
+    const double side = quarter_square_side_length_;
+    const double radius = std::clamp(quarter_square_turn_radius_, 0.0, side);
+    const double straight_length = std::max(0.0, side - radius);
+    const double first_leg_time =
+      (straight_length > 1e-6) ? quarter_square_leg_time_ : 0.0;
+    const double turn_time = (radius > 1e-6) ? quarter_square_turn_time_ : 0.0;
+    const double second_leg_time =
+      (straight_length > 1e-6) ? quarter_square_leg_time_ : 0.0;
+    const double first_leg_end = first_leg_time;
+    const double turn_end = first_leg_end + turn_time;
+    const double second_leg_end = turn_end + second_leg_time;
+
+    x_ref = quarter_square_origin_x_;
+    dx_ref = 0.0;
+    ddx_ref = 0.0;
+    y_ref = quarter_square_origin_y_;
+    dy_ref = 0.0;
+    ddy_ref = 0.0;
+
+    if (t < 0.0) {
+      return;
+    }
+
+    if (t < first_leg_end) {
+      const double s = t / first_leg_time;
+      const double shape = smooth5(s);
+      const double shape_d1 = smooth5_d1(s) / first_leg_time;
+      const double shape_d2 = smooth5_d2(s) / (first_leg_time * first_leg_time);
+
+      x_ref = quarter_square_origin_x_ + straight_length * shape;
+      dx_ref = straight_length * shape_d1;
+      ddx_ref = straight_length * shape_d2;
+      return;
+    }
+
+    if (t < turn_end) {
+      const double s = (t - first_leg_end) / turn_time;
+      const double shape = smooth5(s);
+      const double shape_d1 = smooth5_d1(s) / turn_time;
+      const double shape_d2 = smooth5_d2(s) / (turn_time * turn_time);
+      const double theta = -0.5 * PI + 0.5 * PI * shape;
+      const double theta_dot = 0.5 * PI * shape_d1;
+      const double theta_ddot = 0.5 * PI * shape_d2;
+      const double center_x = quarter_square_origin_x_ + side - radius;
+      const double center_y = quarter_square_origin_y_ + radius;
+
+      x_ref = center_x + radius * std::cos(theta);
+      y_ref = center_y + radius * std::sin(theta);
+      dx_ref = -radius * std::sin(theta) * theta_dot;
+      dy_ref = radius * std::cos(theta) * theta_dot;
+      ddx_ref = -radius * (
+        std::cos(theta) * theta_dot * theta_dot +
+        std::sin(theta) * theta_ddot);
+      ddy_ref = radius * (
+        -std::sin(theta) * theta_dot * theta_dot +
+        std::cos(theta) * theta_ddot);
+      return;
+    }
+
+    if (t < second_leg_end) {
+      const double s = (t - turn_end) / second_leg_time;
+      const double shape = smooth5(s);
+      const double shape_d1 = smooth5_d1(s) / second_leg_time;
+      const double shape_d2 =
+        smooth5_d2(s) / (second_leg_time * second_leg_time);
+
+      x_ref = quarter_square_origin_x_ + side;
+      y_ref = quarter_square_origin_y_ + radius + straight_length * shape;
+      dy_ref = straight_length * shape_d1;
+      ddy_ref = straight_length * shape_d2;
+      return;
+    }
+
+    x_ref = quarter_square_origin_x_ + side;
+    y_ref = quarter_square_origin_y_ + side;
   }
 
   // --------------------------------------------------------------------------
@@ -2136,9 +2402,46 @@ private:
     // Track pitch_ref(t)
     u[WPITCH] = w_pitch * thref;
 
-    for (int i=0;i<4;++i) {
-      xdot[i]     = dq[i];                     // dq
-      xdot[4 + i] = A0_qd[i] + B0_q[i] + u[i]; // dqdot
+    xdot.fill(0.0);
+
+    switch (mission_profile_) {
+      case MissionProfile::FigureEight:
+        for (int i = 0; i < 4; ++i) {
+          xdot[i] = dq[i];
+          xdot[4 + i] = A0_qd[i] + B0_q[i] + u[i];
+        }
+        break;
+
+      case MissionProfile::QuarterSquareHold: {
+        double x_ref = 0.0;
+        double dx_ref = 0.0;
+        double ddx_ref = 0.0;
+        double y_ref = 0.0;
+        double dy_ref = 0.0;
+        double ddy_ref = 0.0;
+        quarter_square_xy_ref_(
+          t,
+          x_ref,
+          dx_ref,
+          ddx_ref,
+          y_ref,
+          dy_ref,
+          ddy_ref);
+
+        (void)x_ref;
+        (void)y_ref;
+
+        xdot[WX] = dx_ref;
+        xdot[WY] = dy_ref;
+        xdot[WZ] = dq[WZ];
+        xdot[WPITCH] = dq[WPITCH];
+
+        xdot[4 + WX] = ddx_ref;
+        xdot[4 + WY] = ddy_ref;
+        xdot[4 + WZ] = A0_qd[WZ] + B0_q[WZ] + u[WZ];
+        xdot[4 + WPITCH] = A0_qd[WPITCH] + B0_q[WPITCH] + u[WPITCH];
+        break;
+      }
     }
   }
 
@@ -2209,11 +2512,19 @@ private:
   double scale_angvel_{1.0};
   double scale_tau_{0.5};
   std::size_t steady_record_stride_{10};
+  double quarter_square_origin_x_{0.0};
+  double quarter_square_origin_y_{0.0};
+  double quarter_square_side_length_{30.0};
+  double quarter_square_turn_radius_{7.5};
+  double quarter_square_leg_time_{80.0};
+  double quarter_square_turn_time_{50.0};
 
   std::array<float, kRbfDim> rbf_lo_{{-1, -1, -1, -1, -1, -1}};
   std::array<float, kRbfDim> rbf_hi_{{1, 1, 1, 1, 1, 1}};
 
   // Waypoint parameters
+  const double figure_eight_amplitude_x_{100.0};
+  const double figure_eight_amplitude_y_{50.0};
   const double wx         = 0.005;
   const double wy         = 2.0 * wx;
   const double z_mid      = -2.0;   // center of [-3, -1]
@@ -2255,12 +2566,15 @@ private:
   LearningPhase learning_phase_{LearningPhase::Learning};
   KnowledgeSource knowledge_source_{KnowledgeSource::LocalAverage};
   FormationProfile formation_profile_{FormationProfile::Training};
+  MissionProfile mission_profile_{MissionProfile::FigureEight};
   LearningPhase pending_learning_phase_{LearningPhase::Learning};
   KnowledgeSource pending_knowledge_source_{KnowledgeSource::LocalAverage};
   FormationProfile pending_formation_profile_{FormationProfile::Training};
+  MissionProfile pending_mission_profile_{MissionProfile::FigureEight};
   bool has_pending_learning_phase_{false};
   bool has_pending_knowledge_source_{false};
   bool has_pending_formation_profile_{false};
+  bool has_pending_mission_profile_{false};
   std::mutex runtime_update_mutex_;
   std::vector<double> steady_weight_sum_;
   std::vector<float> steady_weight_snapshot_;
@@ -2275,6 +2589,8 @@ private:
   std::mutex shared_wbar_mutex_;
   double previous_desired_yaw_{0.0};
   bool previous_desired_yaw_valid_{false};
+  double last_path_heading_{0.0};
+  bool last_path_heading_valid_{false};
 
   // Allocation and actuator state
   std::array<std::string, 4> thr_links_{
